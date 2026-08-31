@@ -8,14 +8,16 @@ uses benchmark, hierarchy, or net names.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
 from .base import (
+    SkillOutput,
     SkillResult,
+    candidate_budget_exhausted,
     calculate_fmax,
     parse_route_status_static,
     parse_timing_summary_static,
@@ -171,10 +173,16 @@ class PathLocalLutReflowSkill:
         recipe_timeout = float(params.get("recipe_timeout_s", 1200.0))
 
         attempts: list[dict] = []
+        feedback_attempts: list[dict] = []
+        candidate_feedback: list[dict] = []
+        candidate_outputs: list[SkillOutput] = []
         best: Optional[dict] = None
         current_input = str(input_dcp)
         current_before_wns = before_wns
         accepted_iterations = 0
+        budget_stopped = False
+        unstarted: list[str] = []
+        stop_sweep = False
 
         logger.info(
             "[path_local_lut_reflow] target=%r paths=%d cells=%d candidates=%d iterations=%d",
@@ -192,6 +200,32 @@ class PathLocalLutReflowSkill:
                     _candidate_offsets(max_cells, max_candidates),
                     1,
                 ):
+                    label = (
+                        f"path_local_lut_reflow window={idx:02d} offset={offset}"
+                    )[:120]
+                    if candidate_budget_exhausted(
+                        params, completed_attempts=len(feedback_attempts)
+                    ):
+                        budget_stopped = True
+                        remaining_offsets = _candidate_offsets(max_cells, max_candidates)
+                        unstarted = [
+                            (
+                                "path_local_lut_reflow "
+                                f"iteration={future_iteration:02d} "
+                                f"window={future_idx:02d} offset={future_offset}"
+                            )[:120]
+                            for future_iteration in range(iteration, max_iterations + 1)
+                            for future_idx, future_offset in enumerate(
+                                (
+                                    remaining_offsets[idx - 1 :]
+                                    if future_iteration == iteration
+                                    else remaining_offsets
+                                ),
+                                idx if future_iteration == iteration else 1,
+                            )
+                        ]
+                        stop_sweep = True
+                        break
                     if max_iterations == 1 or iteration == 1:
                         candidate_dcp = run_dir / (
                             f"path_local_lut_reflow_{idx:02d}_off{offset}.dcp"
@@ -207,6 +241,7 @@ class PathLocalLutReflowSkill:
                         "input_dcp": current_input,
                         "output_dcp": str(candidate_dcp),
                     }
+                    started = time.monotonic()
                     try:
                         await mcp.call_vivado(
                             "open_checkpoint",
@@ -269,12 +304,36 @@ class PathLocalLutReflowSkill:
                             exc,
                         )
                     attempts.append(attempt)
+                    feedback = {
+                        "label": label,
+                        "status": (
+                            "legal" if attempt.get("is_legal") else
+                            "error" if "error" in attempt else "illegal"
+                        ),
+                        "local_metrics": {
+                            "wns": attempt.get("after_wns"),
+                            "delta_wns": (
+                                float(attempt["after_wns"]) - before_wns
+                                if attempt.get("after_wns") is not None
+                                else None
+                            ),
+                        },
+                        "runtime_s": time.monotonic() - started,
+                    }
+                    feedback_attempts.append(feedback)
+                    if iteration == 1 and attempt.get("is_legal"):
+                        candidate_outputs.append(SkillOutput(candidate_dcp, label))
+                        candidate_feedback.append(feedback)
+                    if attempt.get("is_legal") and (
+                        best is None
+                        or float(attempt["after_wns"]) > float(best["after_wns"])
+                    ):
+                        best = attempt
 
+                if stop_sweep:
+                    break
                 if iteration_best is None:
                     break
-
-                if best is None or float(iteration_best["after_wns"]) > float(best["after_wns"]):
-                    best = iteration_best
 
                 delta = float(iteration_best["after_wns"]) - current_before_wns
                 if delta < accept_min_delta:
@@ -285,11 +344,23 @@ class PathLocalLutReflowSkill:
                 current_before_wns = float(iteration_best["after_wns"])
 
             if best is None:
-                return SkillResult.failure(
-                    before_wns,
-                    "no legal path-local LUT reflow candidates: "
-                    + json.dumps(attempts)[:300],
-                    output_dcp,
+                error = "no legal path-local LUT reflow candidates"
+                return SkillResult(
+                    success=False,
+                    before_wns=before_wns,
+                    after_wns=before_wns,
+                    delta_wns=0.0,
+                    is_legal=False,
+                    output_dcp=output_dcp,
+                    summary=f"FAILED: {error}",
+                    error_msg=error,
+                    details={
+                        "attempts": feedback_attempts,
+                        "candidates": candidate_feedback,
+                        "budget_stopped": budget_stopped,
+                        "unstarted": unstarted,
+                        "ancestry": "iterations after 1 descend from the prior local winner",
+                    },
                 )
 
             output_dcp = Path(best["output_dcp"])
@@ -315,6 +386,8 @@ class PathLocalLutReflowSkill:
                     f"best={best['iteration']}.{best['candidate']} "
                     f"wns {before_wns:.3f}->{after_wns:.3f} delta={delta:+.3f}"
                 )
+            if budget_stopped:
+                summary += f" budget_stop {len(feedback_attempts)} attempts"
             return SkillResult(
                 success=True,
                 before_wns=before_wns,
@@ -323,8 +396,26 @@ class PathLocalLutReflowSkill:
                 is_legal=True,
                 output_dcp=output_dcp,
                 summary=summary,
-                details=json.dumps({"attempts": attempts}, default=str)[:4000],
+                details={
+                    "attempts": feedback_attempts,
+                    "candidates": candidate_feedback,
+                    "budget_stopped": budget_stopped,
+                    "unstarted": unstarted,
+                    "ancestry": "iterations after 1 descend from the prior local winner",
+                },
+                candidates=tuple(candidate_outputs),
             )
         except Exception as exc:
             logger.error("[path_local_lut_reflow] failed: %s", exc)
-            return SkillResult.failure(before_wns, str(exc), output_dcp)
+            return SkillResult.failure(
+                before_wns,
+                str(exc),
+                output_dcp,
+                details={
+                    "attempts": feedback_attempts,
+                    "candidates": candidate_feedback,
+                    "budget_stopped": budget_stopped,
+                    "unstarted": unstarted,
+                    "ancestry": "iterations after 1 descend from the prior local winner",
+                },
+            )

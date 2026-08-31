@@ -27,10 +27,17 @@ optimize_cell_placement):
 import json
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .base import SkillResult, parse_timing_summary_static, parse_route_status_static, calculate_fmax
+from .base import (
+    SkillResult,
+    calculate_fmax,
+    open_rapidwright_dcp_in_vivado,
+    parse_route_status_static,
+    parse_timing_summary_static,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -104,19 +111,28 @@ MIN_LUTS_IN_FANIN = 2
 LUT_FANIN_DEPTH = 6
 
 
+@dataclass(frozen=True)
+class FaninLutCheck:
+    """Typed, fail-closed result from the mutation precondition check."""
+
+    kept_pins: tuple[str, ...]
+    counts: dict[str, int]
+    rejection: Optional[str] = None
+
+
 async def _filter_pins_by_fanin_luts(
     mcp, pins: list[str]
-) -> tuple[list[str], dict[str, int]]:
+) -> FaninLutCheck:
     """
     For each pin, ask Vivado how many LUT primitives sit in its fanin cone
     up to LUT_FANIN_DEPTH levels back. Keep only pins with
     >= MIN_LUTS_IN_FANIN.
 
-    Returns (kept_pins, counts_map). On Tcl error the filter degrades to
-    pass-through (fail-open) so the underlying MCP tool still gets a try.
+    A failed Tcl check is a typed rejection.  It must never pass unchecked
+    pins to the mutating RapidWright optimizer.
     """
     if not pins:
-        return [], {}
+        return FaninLutCheck((), {})
 
     # Wrap each pin in literal braces so Tcl doesn't interpret brackets /
     # slashes inside bus indexing (e.g. "sdpram[3]/pipe_3_tvalid/I3").
@@ -138,10 +154,9 @@ async def _filter_pins_by_fanin_luts(
     try:
         resp = await mcp.call_vivado("run_tcl", {"command": cmd}, timeout=120.0)
     except Exception as e:
-        logger.warning(
-            f"[lut_merge] fanin depth check failed ({e}); passing all pins through"
-        )
-        return pins, {}
+        rejection = f"fanin LUT precondition check failed: {e}"
+        logger.warning(f"[lut_merge] {rejection}; rejecting action")
+        return FaninLutCheck((), {}, rejection)
 
     counts: dict[str, int] = {}
     for line in (resp or "").splitlines():
@@ -155,7 +170,7 @@ async def _filter_pins_by_fanin_luts(
             continue
 
     kept = [p for p in pins if counts.get(p, -1) >= MIN_LUTS_IN_FANIN]
-    return kept, counts
+    return FaninLutCheck(tuple(kept), counts)
 
 
 class LutMergeSkill:
@@ -230,7 +245,21 @@ class LutMergeSkill:
             # *replicates* the driver instead, which produced the −0.443 /
             # −0.480 / −0.155 ns regressions observed in the batch run.
             # --------------------------------------------------------------
-            kept_pins, fanin_counts = await _filter_pins_by_fanin_luts(mcp, target_pins)
+            fanin_check = await _filter_pins_by_fanin_luts(mcp, target_pins)
+            if fanin_check.rejection is not None:
+                return SkillResult.failure(
+                    before_wns,
+                    fanin_check.rejection,
+                    output_dcp,
+                    details={
+                        "typed_rejection": {
+                            "reason_code": "FANIN_CHECK_FAILED",
+                            "message": fanin_check.rejection,
+                        }
+                    },
+                )
+            kept_pins = list(fanin_check.kept_pins)
+            fanin_counts = fanin_check.counts
             if fanin_counts:
                 # Log the per-pin counts for the first few; helpful for debug
                 preview = [(p, fanin_counts.get(p, -1)) for p in target_pins[:5]]
@@ -282,6 +311,26 @@ class LutMergeSkill:
 
             optimized_count = int(merge_json.get("optimized_count", 0))
             total = int(merge_json.get("total_pins", len(target_pins)))
+            optimized_cells = [
+                str((item.get("new_cell") or {}).get("name") or "")
+                for item in (merge_json.get("results") or [])
+                if isinstance(item, dict) and item.get("status") == "optimized"
+            ]
+            if (
+                len(optimized_cells) != optimized_count
+                or any(not name or "}" in name for name in optimized_cells)
+            ):
+                return SkillResult.failure(
+                    before_wns,
+                    "RapidWright omitted a valid identity for an optimized LUT",
+                    output_dcp,
+                    details={
+                        "typed_rejection": {
+                            "reason_code": "LUT_MERGE_OPTIMIZED_CELL_IDENTITY_INVALID",
+                            "message": "optimized LUT identities are incomplete",
+                        }
+                    },
+                )
             logger.info(f"[lut_merge] merged {optimized_count}/{total} cones")
 
             if optimized_count == 0:
@@ -307,11 +356,7 @@ class LutMergeSkill:
             if not rw_dcp.exists():
                 return SkillResult.failure(before_wns, "RapidWright DCP not created", output_dcp)
 
-            await mcp.call_vivado(
-                "open_checkpoint",
-                {"dcp_path": str(rw_dcp)},
-                timeout=600.0,
-            )
+            await open_rapidwright_dcp_in_vivado(mcp, rw_dcp, timeout=600.0)
 
             # Merged LUT may be unplaced; run place_design first if so.
             # Cheap no-op if everything is already placed.
@@ -322,7 +367,52 @@ class LutMergeSkill:
                     timeout=1800.0,
                 )
             except Exception as e:
-                logger.warning(f"[lut_merge] place_design skipped / failed: {e}")
+                # Continuing into route_design after placement rejected a LUT6
+                # mapping produced deterministic F6LUT/A6 routing failures.
+                # Placement is a cheap mandatory admission gate, not a warning.
+                return SkillResult.failure(
+                    before_wns,
+                    f"lut_merge placement rejected the merged LUT mapping: {e}",
+                    output_dcp,
+                    details={
+                        "typed_rejection": {
+                            "reason_code": "LUT_MERGE_PLACEMENT_LEGALITY_REJECTED",
+                            "message": str(e)[:500],
+                        }
+                    },
+                )
+
+            cell_list = " ".join("{" + name + "}" for name in optimized_cells)
+            placement_check = await mcp.call_vivado(
+                "run_tcl",
+                {
+                    "command": (
+                        f"set fdagents_cells [get_cells -quiet [list {cell_list}]]; "
+                        f"if {{[llength $fdagents_cells] != {optimized_count}}} "
+                        "{error {merged LUT cell inventory changed}}; "
+                        "set fdagents_unplaced [filter $fdagents_cells "
+                        "{STATUS == UNPLACED}]; "
+                        'puts "FDAGENTS_LUT_MERGE_UNPLACED=[llength '
+                        '$fdagents_unplaced]"'
+                    )
+                },
+                timeout=120.0,
+            )
+            unplaced_match = re.search(
+                r"FDAGENTS_LUT_MERGE_UNPLACED=(\d+)", str(placement_check)
+            )
+            if unplaced_match is None or int(unplaced_match.group(1)) != 0:
+                return SkillResult.failure(
+                    before_wns,
+                    "lut_merge left an optimized LUT unplaced; route was not started",
+                    output_dcp,
+                    details={
+                        "typed_rejection": {
+                            "reason_code": "LUT_MERGE_UNPLACED_OPTIMIZED_CELL",
+                            "message": str(placement_check)[:500],
+                        }
+                    },
+                )
 
             await mcp.call_vivado(
                 "route_design",

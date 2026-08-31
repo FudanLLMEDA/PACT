@@ -2,9 +2,9 @@
 pblock skill — constrain design to a tighter pblock region and re-place/route.
 
 Dynamic range flow (when target is empty):
-  1. Vivado report_utilization_for_pblock  → real LUT/FF/DSP/BRAM counts
+  1. Vivado report_utilization_for_pblock  → real LUT/FF/DSP/BRAM/URAM counts
   2. RapidWright analyze_fabric_for_pblock  → recommended col/row region for 1.5×
-     (enforces DSP/BRAM hard constraints and returns an error if impossible)
+     (enforces DSP/BRAM/URAM hard constraints and returns an error if impossible)
   3. RapidWright convert_fabric_region_to_pblock → "SLICE_X..Y.. DSP.. BRAM.." string
 
 If target is non-empty the string is used directly as the pblock range.
@@ -91,6 +91,12 @@ class PblockSkill:
         run_dir = mcp.run_dir
         input_dcp = params.get("input_dcp")
         util_target = float(params.get("utilization_target", 0.7))
+        if not 0.5 <= util_target <= 0.9:
+            return SkillResult.failure(
+                before_wns,
+                "pblock utilization_target must be in 0.5..0.9",
+                run_dir / "pblock_opt.dcp",
+            )
         place_directive = str(params.get("place_directive", "Default"))
         route_directive = str(params.get("route_directive", "Default"))
         pre_route_phys_opt = str(params.get("pre_route_phys_opt") or "").strip()
@@ -100,12 +106,13 @@ class PblockSkill:
         )
         post_route_phys_opt = str(params.get("post_route_phys_opt") or "").strip()
         resource_multiplier = float(
-            params.get("resource_multiplier", RESOURCE_MULTIPLIER)
+            params.get("resource_multiplier", 1.0 / util_target)
         )
         target_ff_multiplier = float(
             params.get("target_ff_multiplier", resource_multiplier)
         )
         guidance_only = bool(params.get("guidance_only", False))
+        is_soft = bool(params.get("is_soft", guidance_only))
         validate_resources = bool(params.get("validate_resources", not guidance_only))
         max_expansion_attempts = int(
             params.get("max_expansion_attempts", 0 if guidance_only else 3)
@@ -153,7 +160,7 @@ class PblockSkill:
                     "pblock_name": "pblock_opt",
                     "ranges": pblock_ranges,
                     "apply_to": "current_design",
-                    "is_soft": False,
+                    "is_soft": is_soft,
                     "validate_resources": validate_resources,
                     "max_expansion_attempts": max_expansion_attempts,
                 },
@@ -299,18 +306,19 @@ class PblockSkill:
             f"[pblock] real counts: lut={real['lut']} ff={real['ff']} "
             f"dsp={real['dsp']} bram={real['bram']} uram={real['uram']} | "
             f"scaled targets: lut={targets['lut']} ff={targets['ff']} "
-            f"dsp={targets['dsp']} bram={targets['bram']}"
+            f"dsp={targets['dsp']} bram={targets['bram']} uram={targets['uram']}"
         )
         hard_dsp_target = real["dsp"] if hard_resource_floor else 0
         hard_bram_target = real["bram"] if hard_resource_floor else 0
+        hard_uram_target = real["uram"] if hard_resource_floor else 0
         if not hard_resource_floor:
             logger.info(
-                "[pblock] guidance_only: disabling DSP/BRAM hard floors "
+                "[pblock] guidance_only: disabling DSP/BRAM/URAM hard floors "
                 "during fabric-region sizing"
             )
 
         # Step 2: RapidWright — load design and ask for a recommended fabric region.
-        # analyze_fabric_for_pblock now enforces DSP/BRAM counts and returns
+        # analyze_fabric_for_pblock now enforces DSP/BRAM/URAM counts and returns
         # a structured error on shortfall, so we don't need to re-validate.
         await mcp.call_rw(
             "initialize_rapidwright",
@@ -329,6 +337,7 @@ class PblockSkill:
                 "target_ff_count": targets["ff"],
                 "target_dsp_count": hard_dsp_target,
                 "target_bram_count": hard_bram_target,
+                "target_uram_count": hard_uram_target,
             },
             timeout=300.0,
         )
@@ -346,7 +355,8 @@ class PblockSkill:
             f"cols {region['col_min']}-{region['col_max']} "
             f"rows {region['row_min']}-{region['row_max']} | "
             f"actual sites: slices={est.get('slice_sites', '?')} "
-            f"dsp={est.get('dsp_sites', '?')} bram={est.get('bram_sites', '?')}"
+            f"dsp={est.get('dsp_sites', '?')} bram={est.get('bram_sites', '?')} "
+            f"uram={est.get('uram_sites', '?')}"
         )
 
         if pblock_candidate_ranking:

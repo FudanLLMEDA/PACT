@@ -2,32 +2,71 @@
 
 from __future__ import annotations
 
+import math
 import re
 from collections import Counter, defaultdict
 from typing import Any
 
 
 _CLOCK_NET_RE = re.compile(
-    r"(^clk$|/clk$|_clk_|clock|BUFG|MMCM|PLL|TXOUTCLK|RXOUTCLK|USERCLK|CORECLK)",
+    r"((?:^|[/_])(?:ap_)?clk(?:$|[/_])|clock|BUFG|MMCM|PLL|TXOUTCLK|RXOUTCLK|USERCLK|CORECLK)",
     re.IGNORECASE,
 )
-_SITE_RE = re.compile(r"\b(SLICE|DSP48E2|RAMB18|RAMB36|URAM288)_X(\d+)Y(\d+)\b")
-_SPREAD_SPAN_X_THRESHOLD = 30
-_SPREAD_SPAN_Y_THRESHOLD = 50
+_PATH_START_RE = re.compile(r"(?m)^[ \t]*Slack \(")
+_SITE_RE = re.compile(
+    r"^\s*(SLICE|DSP48E2|RAMB18|RAMB36|URAM288)_X(\d+)Y(\d+)\b"
+)
+
+try:  # tool-layer tunables (FDAgents/config.yaml `vivado_mcp:` section)
+    from .mcp_config import tool_param as _tool_param
+except ImportError:  # pragma: no cover — standalone script mode
+    try:
+        from mcp_config import tool_param as _tool_param
+    except ImportError:
+        def _tool_param(_section, _key, default):
+            return default
+
+_SPREAD_SPAN_X_THRESHOLD = int(_tool_param("vivado_mcp", "spread_span_x_threshold", 30))
+_SPREAD_SPAN_Y_THRESHOLD = int(_tool_param("vivado_mcp", "spread_span_y_threshold", 50))
 
 
 def build_timing_path_profile(report: str, max_paths: int = 50) -> dict[str, Any]:
     """Parse a Vivado timing report into a compact, LLM-friendly profile."""
-    paths = _parse_timing_paths(report)[:max_paths]
+    requested_path_count = max(0, max_paths)
+    parsed_paths = _parse_timing_paths(report)
+    paths = parsed_paths[:requested_path_count]
+    returned_path_count = len(paths)
+    sample_may_be_censored = (
+        bool(parsed_paths)
+        if requested_path_count == 0
+        else len(parsed_paths) >= requested_path_count
+    )
+    slack_vector_ns = [
+        (
+            float(path["slack_ns"])
+            if _is_finite_number(path.get("slack_ns"))
+            else None
+        )
+        for path in paths
+    ]
+    path_logic_histograms = [
+        dict(path.get("logic_histogram") or {})
+        for path in paths
+    ]
 
     if not paths:
         return {
             "path_count": 0,
+            "requested_path_count": requested_path_count,
+            "returned_path_count": returned_path_count,
+            "sample_may_be_censored": sample_may_be_censored,
+            "slack_vector_ns": slack_vector_ns,
+            "path_logic_histograms": path_logic_histograms,
             "dominant_bottleneck": "unknown",
             "summary": "No timing paths parsed from report_timing output.",
         }
 
-    slacks = [p["slack_ns"] for p in paths if p.get("slack_ns") is not None]
+    slacks = [value for value in slack_vector_ns if value is not None]
     route_pcts = [p["route_pct"] for p in paths if p.get("route_pct") is not None]
     logic_pcts = [p["logic_pct"] for p in paths if p.get("logic_pct") is not None]
     logic_levels = [p["logic_levels"] for p in paths if p.get("logic_levels") is not None]
@@ -46,7 +85,7 @@ def build_timing_path_profile(report: str, max_paths: int = 50) -> dict[str, Any
     sources = Counter()
     destinations = Counter()
     site_type_hist = Counter()
-    all_slice_sites = []
+    all_sites = []
     path_spreads = []
 
     for idx, path in enumerate(paths, 1):
@@ -57,7 +96,7 @@ def build_timing_path_profile(report: str, max_paths: int = 50) -> dict[str, Any
         ref_hist.update(path.get("logic_histogram", {}))
         sites = path.get("sites", [])
         site_type_hist.update(site["type"] for site in sites)
-        all_slice_sites.extend(site for site in sites if site["type"] == "SLICE")
+        all_sites.extend(sites)
         if path.get("placement_spread"):
             path_spreads.append(path["placement_spread"])
         for net in path.get("nets", []):
@@ -98,13 +137,20 @@ def build_timing_path_profile(report: str, max_paths: int = 50) -> dict[str, Any
     avg_logic_pct = _avg(logic_pcts)
     avg_logic_levels = _avg(logic_levels)
     placement_spread = _aggregate_placement_spread(
-        all_slice_sites,
+        all_sites,
         path_spreads,
         site_type_hist,
     )
 
     profile = {
+        "query_limit": int(max_paths),
+        "query_limit_reached": len(paths) >= int(max_paths),
         "path_count": len(paths),
+        "requested_path_count": requested_path_count,
+        "returned_path_count": returned_path_count,
+        "sample_may_be_censored": sample_may_be_censored,
+        "slack_vector_ns": slack_vector_ns,
+        "path_logic_histograms": path_logic_histograms,
         "worst_slack_ns": min(slacks) if slacks else None,
         "avg_slack_ns": round(_avg(slacks), 3) if slacks else None,
         "avg_route_pct": round(avg_route_pct, 1) if route_pcts else None,
@@ -121,18 +167,30 @@ def build_timing_path_profile(report: str, max_paths: int = 50) -> dict[str, Any
         "top_sources": _counter_top(sources, 8),
         "top_destinations": _counter_top(destinations, 8),
         "top_nets": top_nets[:12],
+        # Retain every bounded path returned by the configured query.  The
+        # Knowledge Agent needs the live slack band and endpoint/net families;
+        # keeping only five paths made dense and censored walls indistinguishable.
         "path_samples": [
             {
-                "slack_ns": p.get("slack_ns"),
+                "slack_ns": (
+                    float(p["slack_ns"])
+                    if _is_finite_number(p.get("slack_ns"))
+                    else None
+                ),
                 "source": p.get("source"),
                 "destination": p.get("destination"),
                 "route_pct": p.get("route_pct"),
                 "logic_levels": p.get("logic_levels"),
+                "logic_histogram": dict(p.get("logic_histogram") or {}),
                 "span_x": (p.get("placement_spread") or {}).get("span_x"),
                 "span_y": (p.get("placement_spread") or {}).get("span_y"),
+                "span_basis": (p.get("placement_spread") or {}).get("span_basis"),
+                "cross_type_span_unavailable": (p.get("placement_spread") or {}).get(
+                    "cross_type_span_unavailable"
+                ),
                 "top_net": p.get("nets", [{}])[0].get("name") if p.get("nets") else None,
             }
-            for p in paths[:5]
+            for p in paths
         ],
     }
     if placement_spread:
@@ -141,21 +199,29 @@ def build_timing_path_profile(report: str, max_paths: int = 50) -> dict[str, Any
 
 
 def _parse_timing_paths(report: str) -> list[dict[str, Any]]:
-    sections = re.split(r"(?=^Slack \()", report, flags=re.MULTILINE)
+    starts = [match.start() for match in _PATH_START_RE.finditer(report)]
     paths = []
-    for section in sections:
-        if not section.startswith("Slack ("):
-            continue
+    for index, start in enumerate(starts):
+        stop = starts[index + 1] if index + 1 < len(starts) else len(report)
+        section = report[start:stop]
         path = _parse_timing_path_section(section)
         if path:
             paths.append(path)
     return paths
 
 
-def _parse_timing_path_section(section: str) -> dict[str, Any]:
+def _parse_timing_path_section(section: str) -> dict[str, Any] | None:
+    if len(_PATH_START_RE.findall(section)) != 1:
+        return None
     slack = _float_match(r"Slack \(.*?\)\s*:\s*(-?\d+(?:\.\d+)?)ns", section)
-    source = _str_match(r"^\s*Source:\s+(\S+)", section)
-    destination = _str_match(r"^\s*Destination:\s+(\S+)", section)
+    sources = re.findall(r"^\s*Source:\s+(\S+)", section, flags=re.MULTILINE)
+    destinations = re.findall(
+        r"^\s*Destination:\s+(\S+)", section, flags=re.MULTILINE
+    )
+    if len(sources) != 1 or len(destinations) != 1:
+        return None
+    source = sources[0]
+    destination = destinations[0]
 
     data = re.search(
         r"Data Path Delay:\s*(-?\d+(?:\.\d+)?)ns\s+"
@@ -176,15 +242,23 @@ def _parse_timing_path_section(section: str) -> dict[str, Any]:
     logic_hist = {}
     if levels_match:
         logic_levels = int(levels_match.group(1))
-        logic_hist = _parse_logic_histogram(levels_match.group(2) or "")
+        parsed_hist = _parse_logic_histogram(levels_match.group(2) or "")
+        logic_hist = parsed_hist if parsed_hist is not None else {}
 
     nets = []
     sites = []
+    seen_sites = set()
     for line in section.splitlines():
+        if re.match(r"^\s+slack\s+\(", line):
+            break
         net = _parse_net_line(line)
         if net:
             nets.append(net)
-        sites.extend(_parse_sites(line))
+        for site in _parse_sites(line):
+            identity = (site["type"], site["x"], site["y"])
+            if identity not in seen_sites:
+                seen_sites.add(identity)
+                sites.append(site)
 
     nets.sort(key=lambda item: (-item["delay_ns"], -item["fanout"], item["name"]))
     placement_spread = _path_placement_spread(sites)
@@ -226,10 +300,12 @@ def _parse_net_line(line: str) -> dict[str, Any] | None:
     }
 
 
-def _parse_logic_histogram(text: str) -> dict[str, int]:
+def _parse_logic_histogram(text: str) -> dict[str, int] | None:
     hist = {}
     for key, value in re.findall(r"([A-Za-z0-9_]+)=(\d+)", text):
-        hist[key] = hist.get(key, 0) + int(value)
+        if key in hist:
+            return None
+        hist[key] = int(value)
     return hist
 
 
@@ -247,21 +323,34 @@ def _parse_sites(line: str) -> list[dict[str, Any]]:
 
 
 def _path_placement_spread(sites: list[dict[str, Any]]) -> dict[str, Any] | None:
-    slice_sites = [site for site in sites if site["type"] == "SLICE"]
-    if not slice_sites:
+    if not sites:
         return None
-    return _spread_from_sites(slice_sites)
+    sites_by_type = _sites_by_type(sites)
+    type_spreads = {
+        site_type: _spread_from_sites(type_sites)
+        for site_type, type_sites in sites_by_type.items()
+    }
+    return {
+        "span_x": max(spread["span_x"] for spread in type_spreads.values()),
+        "span_y": max(spread["span_y"] for spread in type_spreads.values()),
+        "span_basis": "max_within_site_type",
+        "cross_type_span_unavailable": len(type_spreads) > 1,
+        "site_type_spans": type_spreads,
+    }
 
 
 def _aggregate_placement_spread(
-    all_slice_sites: list[dict[str, Any]],
+    all_sites: list[dict[str, Any]],
     path_spreads: list[dict[str, Any]],
     site_type_hist: Counter,
 ) -> dict[str, Any] | None:
-    if not all_slice_sites and not path_spreads:
+    if not all_sites and not path_spreads:
         return None
 
-    bbox = _spread_from_sites(all_slice_sites) if all_slice_sites else {}
+    aggregate_type_spreads = {
+        site_type: _spread_from_sites(type_sites)
+        for site_type, type_sites in _sites_by_type(all_sites).items()
+    }
     span_xs = [spread["span_x"] for spread in path_spreads]
     span_ys = [spread["span_y"] for spread in path_spreads]
     spread_path_count = sum(
@@ -274,8 +363,19 @@ def _aggregate_placement_spread(
     return {
         "path_count_with_sites": len(path_spreads),
         "site_type_counts": dict(site_type_hist.most_common()),
-        "bbox_span_x": bbox.get("span_x"),
-        "bbox_span_y": bbox.get("span_y"),
+        "bbox_span_x": (
+            max(spread["span_x"] for spread in aggregate_type_spreads.values())
+            if aggregate_type_spreads
+            else None
+        ),
+        "bbox_span_y": (
+            max(spread["span_y"] for spread in aggregate_type_spreads.values())
+            if aggregate_type_spreads
+            else None
+        ),
+        "span_basis": "max_within_site_type",
+        "cross_type_span_unavailable": len(aggregate_type_spreads) > 1,
+        "site_type_spans": aggregate_type_spreads,
         "avg_path_span_x": round(_avg(span_xs), 1) if span_xs else None,
         "avg_path_span_y": round(_avg(span_ys), 1) if span_ys else None,
         "max_path_span_x": max(span_xs) if span_xs else None,
@@ -299,6 +399,13 @@ def _spread_from_sites(sites: list[dict[str, Any]]) -> dict[str, Any]:
         "span_x": max(xs) - min(xs),
         "span_y": max(ys) - min(ys),
     }
+
+
+def _sites_by_type(sites: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for site in sites:
+        grouped[site["type"]].append(site)
+    return grouped
 
 
 def _classify_bottleneck(paths: list[dict[str, Any]], top_nets: list[dict[str, Any]]) -> str:
@@ -337,6 +444,14 @@ def _avg(values: list[float]) -> float:
     if not values:
         return 0.0
     return sum(values) / len(values)
+
+
+def _is_finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
 
 
 def _float_match(pattern: str, text: str) -> float | None:

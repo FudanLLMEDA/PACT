@@ -15,15 +15,20 @@ Target semantics:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
 from .base import (
+    SkillOutput,
     SkillResult,
+    candidate_budget_exhausted,
     calculate_fmax,
+    open_rapidwright_dcp_in_vivado,
     parse_route_status_static,
     parse_timing_summary_static,
 )
@@ -237,7 +242,17 @@ class LutPinSwapSkill:
                 swaps_by_cell = _parse_explicit_target(target, params)
 
             if target != "auto" and not swaps_by_cell:
-                return SkillResult.failure(before_wns, "no swaps selected", output_dcp)
+                return SkillResult.failure(
+                    before_wns,
+                    "no swaps selected",
+                    output_dcp,
+                    details={
+                        "attempts": [],
+                        "candidates": [],
+                        "budget_stopped": False,
+                        "unstarted": [],
+                    },
+                )
 
             await mcp.call_rw(
                 "initialize_rapidwright",
@@ -248,11 +263,17 @@ class LutPinSwapSkill:
 
             if target == "auto" and bool(params.get("sweep_candidates", True)):
                 attempts = []
+                feedback_attempts: list[dict] = []
+                candidate_feedback: list[dict] = []
+                candidate_outputs: list[SkillOutput] = []
                 accepted = []
                 accepted_swap_keys: set[tuple[str, str]] = set()
                 current_dcp = str(dcp_to_open)
                 current_wns = before_wns
                 best_seen = None
+                budget_stopped = False
+                unstarted: list[str] = []
+                stop_sweep = False
 
                 for iteration in range(1, max_iterations + 1):
                     await mcp.call_vivado(
@@ -272,6 +293,13 @@ class LutPinSwapSkill:
                             before_wns,
                             "extract_critical_path_pins produced no file",
                             output_dcp,
+                            details={
+                                "attempts": feedback_attempts,
+                                "candidates": candidate_feedback,
+                                "budget_stopped": budget_stopped,
+                                "unstarted": unstarted,
+                                "ancestry": "iterations after 1 descend from the prior local winner",
+                            },
                         )
 
                     critical_paths = json.loads(pins_file.read_text())
@@ -287,6 +315,13 @@ class LutPinSwapSkill:
                             before_wns,
                             "no LUT input pins found on critical paths",
                             output_dcp,
+                            details={
+                                "attempts": feedback_attempts,
+                                "candidates": candidate_feedback,
+                                "budget_stopped": budget_stopped,
+                                "unstarted": unstarted,
+                                "ancestry": "iterations after 1 descend from the prior local winner",
+                            },
                         )
 
                     prefilter_result = None
@@ -345,6 +380,19 @@ class LutPinSwapSkill:
 
                     iteration_best = None
                     for idx, (cell_name, pin_swaps) in enumerate(iteration_swaps.items(), 1):
+                        pin_identity = "-".join(str(item) for item in pin_swaps[0])
+                        base_label = (
+                            f"lut_pin_swap iteration={iteration:02d} "
+                            f"cell={_safe_name(cell_name)} pin={_safe_name(pin_identity)}"
+                        )[:120]
+                        if candidate_budget_exhausted(
+                            params, completed_attempts=len(feedback_attempts)
+                        ):
+                            budget_stopped = True
+                            unstarted = [base_label, "later LUT swap variants"]
+                            stop_sweep = True
+                            break
+                        cell_started = time.monotonic()
                         await mcp.call_rw(
                             "read_checkpoint",
                             {"dcp_path": current_dcp},
@@ -374,12 +422,24 @@ class LutPinSwapSkill:
                         }
                         if processed == 0:
                             attempts.append(base_attempt)
+                            feedback_attempts.append(
+                                {
+                                    "label": base_label,
+                                    "status": "skipped",
+                                    "local_metrics": {"processed_swaps": 0},
+                                    "runtime_s": time.monotonic() - cell_started,
+                                }
+                            )
                             continue
 
                         pin_tag = "_".join(str(p) for p in pin_swaps[0])
+                        identity_digest = hashlib.sha1(
+                            f"{cell_name}|{pin_tag}".encode("utf-8")
+                        ).hexdigest()[:10]
                         tag = (
                             f"iter{iteration:02d}_{idx:02d}_"
-                            f"{_safe_name(cell_name)}_{_safe_name(pin_tag)}"
+                            f"{_safe_name(cell_name)[:40]}_"
+                            f"{_safe_name(pin_tag)}_{identity_digest}"
                         )
                         rw_dcp = run_dir / f"lut_pin_swap_{tag}_rw.dcp"
 
@@ -395,66 +455,109 @@ class LutPinSwapSkill:
                             continue
 
                         for directive in route_directives:
+                            label = (
+                                f"lut_pin_swap iteration={iteration:02d} "
+                                f"route={_safe_name(directive)} "
+                                f"cell={_safe_name(cell_name)} "
+                                f"pin={_safe_name(pin_identity)}"
+                            )[:120]
+                            if candidate_budget_exhausted(
+                                params, completed_attempts=len(feedback_attempts)
+                            ):
+                                budget_stopped = True
+                                unstarted = [label, "later LUT swap variants"]
+                                stop_sweep = True
+                                break
+                            started = time.monotonic()
                             directive_tag = _safe_name(directive)
                             candidate_dcp = run_dir / f"lut_pin_swap_{tag}_{directive_tag}.dcp"
                             attempt = dict(base_attempt)
                             attempt["route_directive"] = directive
                             attempt["rw_dcp"] = str(rw_dcp)
 
-                            await mcp.call_vivado(
-                                "open_checkpoint",
-                                {"dcp_path": str(rw_dcp)},
-                                timeout=600.0,
-                            )
-                            await mcp.call_vivado(
-                                "route_design",
-                                {"directive": directive},
-                                timeout=3600.0,
-                            )
-
-                            route_report = await mcp.call_vivado(
-                                "report_route_status", {}, timeout=120.0
-                            )
-                            route = parse_route_status_static(route_report)
-                            is_legal = bool(route.get("routed_ok"))
-
-                            after_wns = await mcp.get_wns()
-                            if after_wns is None:
-                                ts = await mcp.call_vivado(
-                                    "report_timing_summary", {}, timeout=300.0
+                            try:
+                                await open_rapidwright_dcp_in_vivado(
+                                    mcp, rw_dcp, timeout=600.0
                                 )
-                                parsed = parse_timing_summary_static(ts)
-                                after_wns = parsed.get("wns") or current_wns
+                                await mcp.call_vivado(
+                                    "route_design",
+                                    {"directive": directive},
+                                    timeout=3600.0,
+                                )
 
-                            await mcp.call_vivado(
-                                "write_checkpoint",
-                                {"dcp_path": str(candidate_dcp.resolve()), "force": True},
-                                timeout=600.0,
-                            )
+                                route_report = await mcp.call_vivado(
+                                    "report_route_status", {}, timeout=120.0
+                                )
+                                route = parse_route_status_static(route_report)
+                                is_legal = bool(route.get("routed_ok"))
 
-                            attempt.update(
-                                {
-                                    "after_wns": after_wns,
-                                    "delta_wns": after_wns - current_wns,
-                                    "total_delta_wns": after_wns - before_wns,
-                                    "is_legal": is_legal,
-                                    "route": route,
-                                    "output_dcp": str(candidate_dcp),
-                                }
-                            )
+                                after_wns = await mcp.get_wns()
+                                if after_wns is None:
+                                    ts = await mcp.call_vivado(
+                                        "report_timing_summary", {}, timeout=300.0
+                                    )
+                                    parsed = parse_timing_summary_static(ts)
+                                    after_wns = parsed.get("wns") or current_wns
+
+                                await mcp.call_vivado(
+                                    "write_checkpoint",
+                                    {
+                                        "dcp_path": str(candidate_dcp.resolve()),
+                                        "force": True,
+                                    },
+                                    timeout=600.0,
+                                )
+
+                                attempt.update(
+                                    {
+                                        "after_wns": after_wns,
+                                        "delta_wns": after_wns - current_wns,
+                                        "total_delta_wns": after_wns - before_wns,
+                                        "is_legal": is_legal,
+                                        "route": route,
+                                        "output_dcp": str(candidate_dcp),
+                                    }
+                                )
+                            except Exception as exc:
+                                attempt.update({"error": str(exc), "is_legal": False})
                             attempts.append(attempt)
 
-                            if is_legal and (
+                            feedback = {
+                                "label": label,
+                                "status": (
+                                    "legal" if attempt.get("is_legal") else
+                                    "error" if "error" in attempt else "illegal"
+                                ),
+                                "local_metrics": {
+                                    "wns": attempt.get("after_wns"),
+                                    "delta_wns": attempt.get("total_delta_wns"),
+                                    "processed_swaps": processed,
+                                },
+                                "runtime_s": time.monotonic() - started,
+                            }
+                            feedback_attempts.append(feedback)
+
+                            if iteration == 1 and attempt.get("is_legal"):
+                                candidate_outputs.append(
+                                    SkillOutput(candidate_dcp, label)
+                                )
+                                candidate_feedback.append(feedback)
+                            if attempt.get("is_legal") and (
                                 iteration_best is None
-                                or after_wns > iteration_best["after_wns"]
+                                or attempt["after_wns"] > iteration_best["after_wns"]
                             ):
                                 iteration_best = attempt
-                            if is_legal and (
+                            if attempt.get("is_legal") and (
                                 best_seen is None
-                                or after_wns > best_seen["after_wns"]
+                                or attempt["after_wns"] > best_seen["after_wns"]
                             ):
                                 best_seen = attempt
 
+                        if stop_sweep:
+                            break
+
+                    if stop_sweep:
+                        break
                     if iteration_best is None:
                         break
 
@@ -469,11 +572,23 @@ class LutPinSwapSkill:
                     current_wns = iteration_best["after_wns"]
 
                 if best_seen is None:
-                    return SkillResult.failure(
-                        before_wns,
-                        "RapidWright processed 0 legal LUT pin swap candidates: "
-                        + json.dumps(attempts)[:300],
-                        output_dcp,
+                    error = "RapidWright processed 0 legal LUT pin swap candidates"
+                    return SkillResult(
+                        success=False,
+                        before_wns=before_wns,
+                        after_wns=before_wns,
+                        delta_wns=0.0,
+                        is_legal=False,
+                        output_dcp=output_dcp,
+                        summary=f"FAILED: {error}",
+                        error_msg=error,
+                        details={
+                            "attempts": feedback_attempts,
+                            "candidates": candidate_feedback,
+                            "budget_stopped": budget_stopped,
+                            "unstarted": unstarted,
+                            "ancestry": "iterations after 1 descend from the prior local winner",
+                        },
                     )
 
                 final_attempt = accepted[-1] if accepted else best_seen
@@ -481,6 +596,11 @@ class LutPinSwapSkill:
                 delta = after_wns - before_wns
                 best_cell = str(final_attempt["cell"]).split("/")[-1]
                 output_dcp = Path(final_attempt["output_dcp"])
+                await mcp.call_vivado(
+                    "open_checkpoint",
+                    {"dcp_path": str(output_dcp.resolve())},
+                    timeout=600.0,
+                )
                 fmax_b = calculate_fmax(before_wns, clock_period)
                 fmax_a = calculate_fmax(after_wns, clock_period)
                 prefix = "greedy" if accepted else "sweep"
@@ -496,6 +616,30 @@ class LutPinSwapSkill:
                         f"iters={len(accepted)} wns {before_wns:.3f}->{after_wns:.3f} "
                         f"delta={delta:+.3f}"
                     )
+                if budget_stopped:
+                    summary += f" budget_stop {len(feedback_attempts)} attempts"
+
+                output_cap = int(
+                    params.get("_candidate_output_cap", len(candidate_outputs) or 1)
+                )
+                if output_cap < 1:
+                    raise ValueError("_candidate_output_cap must be at least 1")
+                candidate_count_before_cap = len(candidate_outputs)
+                if candidate_count_before_cap > output_cap:
+                    ranked_outputs = sorted(
+                        enumerate(zip(candidate_outputs, candidate_feedback)),
+                        key=lambda item: (
+                            -float(
+                                item[1][1].get("local_metrics", {}).get("wns")
+                                if item[1][1].get("local_metrics", {}).get("wns")
+                                is not None
+                                else float("-inf")
+                            ),
+                            item[0],
+                        ),
+                    )[:output_cap]
+                    candidate_outputs = [item[1][0] for item in ranked_outputs]
+                    candidate_feedback = [item[1][1] for item in ranked_outputs]
 
                 return SkillResult(
                     success=True,
@@ -505,11 +649,21 @@ class LutPinSwapSkill:
                     is_legal=True,
                     output_dcp=output_dcp,
                     summary=summary,
-                    details=json.dumps(
-                        {"accepted": accepted, "attempts": attempts}
-                    )[:4000],
+                    details={
+                        "attempts": feedback_attempts,
+                        "candidates": candidate_feedback,
+                        "candidate_output_count_before_cap": (
+                            candidate_count_before_cap
+                        ),
+                        "candidate_output_cap": output_cap,
+                        "budget_stopped": budget_stopped,
+                        "unstarted": unstarted,
+                        "ancestry": "iterations after 1 descend from the prior local winner",
+                    },
+                    candidates=tuple(candidate_outputs),
                 )
 
+            serial_started = time.monotonic()
             await mcp.call_rw(
                 "read_checkpoint",
                 {"dcp_path": dcp_to_open},
@@ -539,6 +693,18 @@ class LutPinSwapSkill:
                     "RapidWright processed 0 LUT pin swaps: "
                     + json.dumps(rw_results)[:300],
                     output_dcp,
+                    details={
+                        "attempts": [{
+                            "label": "lut_pin_swap explicit serial edit",
+                            "status": "error",
+                            "local_metrics": {"processed_swaps": 0},
+                            "runtime_s": time.monotonic() - serial_started,
+                        }],
+                        "candidates": [],
+                        "budget_stopped": False,
+                        "unstarted": [],
+                        "ancestry": "explicit multi-cell edits form one serial output",
+                    },
                 )
 
             rw_dcp = run_dir / "lut_pin_swap_rw.dcp"
@@ -549,14 +715,24 @@ class LutPinSwapSkill:
             )
             if not rw_dcp.exists():
                 return SkillResult.failure(
-                    before_wns, "RapidWright DCP not created", output_dcp
+                    before_wns,
+                    "RapidWright DCP not created",
+                    output_dcp,
+                    details={
+                        "attempts": [{
+                            "label": "lut_pin_swap explicit serial edit",
+                            "status": "error",
+                            "local_metrics": {"processed_swaps": processed},
+                            "runtime_s": time.monotonic() - serial_started,
+                        }],
+                        "candidates": [],
+                        "budget_stopped": False,
+                        "unstarted": [],
+                        "ancestry": "explicit multi-cell edits form one serial output",
+                    },
                 )
 
-            await mcp.call_vivado(
-                "open_checkpoint",
-                {"dcp_path": str(rw_dcp)},
-                timeout=600.0,
-            )
+            await open_rapidwright_dcp_in_vivado(mcp, rw_dcp, timeout=600.0)
             await mcp.call_vivado(
                 "route_design",
                 {"directive": route_directive},
@@ -607,9 +783,38 @@ class LutPinSwapSkill:
                 is_legal=is_legal,
                 output_dcp=output_dcp,
                 summary=summary,
-                details=json.dumps(rw_results)[:4000],
+                details={
+                    "attempts": [{
+                        "label": (
+                            "lut_pin_swap explicit "
+                            f"cells={len(swaps_by_cell)} "
+                            f"route={_safe_name(str(route_directive))}"
+                        )[:120],
+                        "status": "legal" if is_legal else "illegal",
+                        "local_metrics": {
+                            "wns": after_wns,
+                            "delta_wns": delta,
+                            "processed_swaps": processed,
+                        },
+                        "runtime_s": time.monotonic() - serial_started,
+                    }],
+                    "candidates": [],
+                    "budget_stopped": False,
+                    "unstarted": [],
+                    "ancestry": "explicit multi-cell edits form one serial output",
+                },
             )
 
         except Exception as e:
             logger.error("[lut_pin_swap] failed: %s", e)
-            return SkillResult.failure(before_wns, str(e), output_dcp)
+            return SkillResult.failure(
+                before_wns,
+                str(e),
+                output_dcp,
+                details={
+                    "attempts": [],
+                    "candidates": [],
+                    "budget_stopped": False,
+                    "unstarted": [],
+                },
+            )

@@ -26,8 +26,8 @@ sha256sum -c SHA256SUMS
 DCP path, original Fmax, and resource counts. Do not use optimized output DCPs
 as inputs; every file listed here is an original evaluation checkpoint.
 
-The deterministic no-LLM smoke test can be run from the repository root with:
+The deterministic no-LLM workflow can be run from the repository root with:
 
 ```bash
-scripts/run_functional_smoke.sh vexriscv logicnets
+make run_test DCP=benchmarks/vexriscv_re-place_2025.1.dcp
 ```

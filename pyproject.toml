@@ -1,0 +1,13 @@
+[project]
+name = "fpl26-optimization-agent"
+version = "0.1.0"
+requires-python = "==3.13.14"
+dependencies = [
+    "mcp==1.28.1",
+    "openai>=1.0.0",
+    "pexpect>=4.8.0",
+    "python-dotenv>=1.0.0",
+    "pyyaml>=6.0",
+    "rapidwright>=2025.2.1",
+    "z3-solver>=4.12.0",
+]

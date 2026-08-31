@@ -17,16 +17,19 @@ Why per-net unroute (and not a global `route_design -unroute`)?
     placement and replication knobs have saturated.
 
 Target picking:
-    Pass the net name as `target`. Good candidates are the *intermediate*
-    high-fanout LUT outputs on the critical path (fanout 30-100 in a
-    cluster), NOT the source-FF Q-net of the worst path — Vivado's source-FF
-    rebalancer (force_replication on FF outputs) often refuses with
-    "[Physopt 32-745] WNS magnitude too large for post-route phys_opt".
+    The public `auto` target selects one non-clock, mid-fanout net from the
+    worst paths before any mutation. Good candidates are the *intermediate*
+    high-fanout LUT outputs on the critical path (fanout 20-100 in a cluster),
+    NOT the source-FF Q-net of the worst path — Vivado's source-FF rebalancer
+    (force_replication on FF outputs) often refuses with "[Physopt 32-745] WNS
+    magnitude too large for post-route phys_opt".
 """
 
 import logging
+import re
 from typing import Optional
 
+from ..parsers import parse_high_fanout_nets
 from .base import (
     SkillResult,
     parse_timing_summary_static,
@@ -35,6 +38,32 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+AUTO_TARGET = "auto"
+DEFAULT_NUM_PATHS = 5
+DEFAULT_MIN_FANOUT = 20
+DEFAULT_MAX_FANOUT = 100
+DEFAULT_REPLICATION_PASSES = 2
+DEFAULT_ROUTE_TIMEOUT_S = 1800.0
+
+
+def _parse_high_fanout_candidates(report: str, max_fanout: int) -> list[str]:
+    """Parse the same bounded table and exact net column as analysis.
+
+    The report appends driver capability columns after the net name.  A local
+    regex previously absorbed those columns into the Tcl selector, while a
+    narrower path census could independently hide analyzer-certified rows.
+    Sharing the parser keeps the discovery contract identical without carrying
+    a historical selector into execution.
+    """
+    candidates = []
+    seen = set()
+    for net_name, fanout, _path_count in parse_high_fanout_nets(str(report or "")):
+        if fanout > max_fanout or net_name in seen:
+            continue
+        seen.add(net_name)
+        candidates.append(net_name)
+    return candidates
 
 
 def _tcl_quote(net_name: str) -> str:
@@ -55,14 +84,54 @@ class PerNetUnrouteSkill:
         clock_period: Optional[float],
     ) -> SkillResult:
         run_dir = mcp.run_dir
-        net_name = target
-        safe = net_name.replace("/", "_").replace("[", "_").replace("]", "_")
-        output_dcp = run_dir / f"per_net_unroute_{safe}.dcp"
-        net_tcl = _tcl_quote(net_name)
-
-        logger.info(f"[per_net_unroute] net={net_name}")
+        net_name = str(target or AUTO_TARGET).strip() or AUTO_TARGET
+        num_paths = int(params.get("num_paths", DEFAULT_NUM_PATHS))
+        min_fanout = int(params.get("min_fanout", DEFAULT_MIN_FANOUT))
+        max_fanout = int(params.get("max_fanout", DEFAULT_MAX_FANOUT))
+        replication_passes = int(
+            params.get("replication_passes", DEFAULT_REPLICATION_PASSES)
+        )
+        route_timeout_s = float(
+            params.get("route_timeout_s", DEFAULT_ROUTE_TIMEOUT_S)
+        )
+        output_dcp = run_dir / "per_net_unroute_auto.dcp"
 
         try:
+            if net_name == AUTO_TARGET:
+                discovery = await mcp.call_vivado(
+                    "get_critical_high_fanout_nets",
+                    {
+                        "num_paths": num_paths,
+                        "min_fanout": min_fanout,
+                        "exclude_clocks": True,
+                    },
+                    timeout=600.0,
+                )
+                candidates = _parse_high_fanout_candidates(discovery, max_fanout)
+                if not candidates:
+                    return SkillResult.failure(
+                        before_wns,
+                        "auto preflight found no non-clock critical net with "
+                        f"fanout in {min_fanout}..{max_fanout}",
+                        output_dcp,
+                        details={"preflight_candidate_count": 0},
+                    )
+                net_name = candidates[0]
+                logger.info(
+                    "[per_net_unroute] auto preflight candidates=%d selected=%s",
+                    len(candidates),
+                    net_name,
+                )
+
+            safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", net_name).strip("_") or "net"
+            output_dcp = run_dir / f"per_net_unroute_{safe}.dcp"
+            net_tcl = _tcl_quote(net_name)
+            logger.info(
+                "[per_net_unroute] net=%s replication_passes=%d",
+                net_name,
+                replication_passes,
+            )
+
             # 1. Per-net unroute. If the net doesn't exist or isn't routable,
             # bail out before mutating anything else.
             unroute_cmd = (
@@ -87,7 +156,7 @@ class PerNetUnrouteSkill:
             # 2. Two passes of force_replication on the same net. The second
             # pass is what produces the FF/LUT clone; the first pass alone
             # often only inserts a buffer.
-            for i in (1, 2):
+            for i in range(1, replication_passes + 1):
                 rep_cmd = (
                     f"set net [get_nets {net_tcl}]; "
                     f"phys_opt_design -force_replication_on_nets $net"
@@ -104,13 +173,13 @@ class PerNetUnrouteSkill:
             # 3. Route the unrouted segment back. Plain route_design is
             # enough — AlternateCLBRouting tends to undo the local optimum.
             await mcp.call_vivado(
-                "route_design", {}, timeout=1800.0,
+                "route_design", {}, timeout=route_timeout_s,
             )
 
             # 4. Measure timing + route legality.
             rs = await mcp.call_vivado("report_route_status", {}, timeout=120.0)
             route = parse_route_status_static(rs)
-            is_legal = bool(route.get("routed_ok", True))
+            is_legal = bool(route.get("routed_ok"))
 
             after_wns = await mcp.get_wns()
             if after_wns is None:
@@ -119,14 +188,15 @@ class PerNetUnrouteSkill:
                 after_wns = parsed.get("wns") or before_wns
 
             delta = after_wns - before_wns
-            if delta > 0.001:
-                await mcp.call_vivado(
-                    "write_checkpoint",
-                    {"dcp_path": str(output_dcp.resolve()), "force": True},
-                    timeout=600.0,
+            if not is_legal:
+                return SkillResult.failure(
+                    before_wns, "candidate is not fully routed", output_dcp
                 )
-            else:
-                output_dcp = run_dir / "current.dcp"
+            await mcp.call_vivado(
+                "write_checkpoint",
+                {"dcp_path": str(output_dcp.resolve()), "force": True},
+                timeout=600.0,
+            )
 
             fmax_b = calculate_fmax(before_wns, clock_period)
             fmax_a = calculate_fmax(after_wns, clock_period)

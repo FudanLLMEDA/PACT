@@ -7,6 +7,9 @@ from typing import Any, Iterable
 
 
 _SLICE_SITE_RE = re.compile(r"^SLICE_X(\d+)Y(\d+)$")
+_CLOCK_REGION_RANGE_RE = re.compile(
+    r"^CLOCKREGION_X(\d+)Y(\d+):CLOCKREGION_X(\d+)Y(\d+)$"
+)
 
 
 def _clamp_window(start: int, span: int, lower: int, upper: int) -> tuple[int, int]:
@@ -57,6 +60,268 @@ def _count(data: dict[str, Any] | None, *keys: str) -> int:
         if value is not None:
             return int(value)
     return 0
+
+
+def _normalize_requirements(value: dict[str, Any] | None) -> dict[str, int]:
+    return {
+        "lut": _count(value, "lut", "luts"),
+        "ff": _count(value, "ff", "ffs"),
+        "dsp": _count(value, "dsp", "dsps"),
+        "bram": _count(value, "bram", "brams"),
+        "uram": _count(value, "uram", "urams"),
+    }
+
+
+def _clock_region_range(coords: Iterable[tuple[int, int]]) -> str:
+    points = list(coords)
+    if not points:
+        return ""
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    return (
+        f"CLOCKREGION_X{min(xs)}Y{min(ys)}:"
+        f"CLOCKREGION_X{max(xs)}Y{max(ys)}"
+    )
+
+
+def _clock_region_capacity(records: Iterable[dict[str, Any]]) -> dict[str, int]:
+    capacity = {"slice_sites": 0, "lut": 0, "ff": 0, "dsp": 0, "bram": 0, "uram": 0}
+    for record in records:
+        resources = record.get("resources") if isinstance(record, dict) else None
+        slices = _count(resources, "slice_sites", "slices")
+        capacity["slice_sites"] += slices
+        capacity["lut"] += (
+            _count(resources, "lut_capacity")
+            if resources and "lut_capacity" in resources
+            else slices * 4
+        )
+        capacity["ff"] += (
+            _count(resources, "ff_capacity")
+            if resources and "ff_capacity" in resources
+            else slices * 8
+        )
+        capacity["dsp"] += _count(resources, "dsp_sites", "dsps", "dsp")
+        capacity["bram"] += _count(resources, "bram_sites", "brams", "bram")
+        capacity["uram"] += _count(resources, "uram_sites", "urams", "uram")
+    return capacity
+
+
+def _capacity_holds(
+    capacity: dict[str, int], requirements: dict[str, int]
+) -> bool:
+    return all(capacity[key] >= requirements[key] for key in requirements)
+
+
+def clock_region_ranges_overlap(left: str, right: str) -> bool:
+    """Return whether two inclusive CLOCKREGION rectangles overlap."""
+    left_match = _CLOCK_REGION_RANGE_RE.fullmatch(str(left).strip())
+    right_match = _CLOCK_REGION_RANGE_RE.fullmatch(str(right).strip())
+    if left_match is None or right_match is None:
+        raise ValueError("clock-region range is malformed")
+    lx0, ly0, lx1, ly1 = map(int, left_match.groups())
+    rx0, ry0, rx1, ry1 = map(int, right_match.groups())
+    return not (lx1 < rx0 or rx1 < lx0 or ly1 < ry0 or ry1 < ly0)
+
+
+def build_clock_region_pblock_candidates(
+    clock_regions: Iterable[dict[str, Any]],
+    *,
+    critical_requirements: dict[str, Any] | None,
+    remainder_requirements: dict[str, Any] | None,
+    max_single_candidates: int = 2,
+    max_multi_candidates: int = 2,
+) -> dict[str, Any]:
+    """Build capacity-safe clock-aligned single and two-part siblings.
+
+    The grid is supplied by RapidWright's Device API.  Every emitted rectangle
+    is expressed in Vivado's normal ``CLOCKREGION_X..Y..`` pblock range format.
+    Two-region candidates are guillotine partitions of that grid, so their
+    critical and remainder pblocks are mutually exclusive by construction.
+    """
+    normalized = []
+    seen = set()
+    for item in clock_regions:
+        if not isinstance(item, dict):
+            continue
+        x = int(item["x"])
+        y = int(item["y"])
+        if (x, y) in seen:
+            continue
+        seen.add((x, y))
+        normalized.append({**item, "x": x, "y": y})
+    normalized.sort(key=lambda item: (item["y"], item["x"]))
+    if not normalized:
+        return {"candidates": [], "reason": "empty clock-region grid"}
+
+    critical = _normalize_requirements(critical_requirements)
+    remainder = _normalize_requirements(remainder_requirements)
+    total = {key: critical[key] + remainder[key] for key in critical}
+    xs = sorted({item["x"] for item in normalized})
+    ys = sorted({item["y"] for item in normalized})
+    by_coord = {(item["x"], item["y"]): item for item in normalized}
+
+    weighted = [
+        item for item in normalized if int(item.get("critical_cell_count", 0)) > 0
+    ]
+    weight_key = "critical_cell_count"
+    if not weighted:
+        weighted = [
+            item for item in normalized if int(item.get("occupied_cell_count", 0)) > 0
+        ]
+        weight_key = "occupied_cell_count"
+    if weighted:
+        total_weight = sum(max(0, int(item.get(weight_key, 0))) for item in weighted)
+        centroid_x = sum(
+            item["x"] * max(0, int(item.get(weight_key, 0))) for item in weighted
+        ) / max(1, total_weight)
+        centroid_y = sum(
+            item["y"] * max(0, int(item.get(weight_key, 0))) for item in weighted
+        ) / max(1, total_weight)
+        anchor = min(
+            weighted,
+            key=lambda item: (
+                abs(item["x"] - centroid_x) + abs(item["y"] - centroid_y),
+                -int(item.get(weight_key, 0)),
+                item["y"],
+                item["x"],
+            ),
+        )
+        anchor_x, anchor_y = anchor["x"], anchor["y"]
+    else:
+        anchor_x, anchor_y = xs[len(xs) // 2], ys[len(ys) // 2]
+
+    def rectangle(x0: int, x1: int, y0: int, y1: int) -> list[dict[str, Any]]:
+        return [
+            by_coord[(x, y)]
+            for y in ys
+            for x in xs
+            if x0 <= x <= x1 and y0 <= y <= y1 and (x, y) in by_coord
+        ]
+
+    singles = []
+    single_options = []
+    for x0 in xs:
+        for x1 in xs:
+            if x0 > anchor_x or x1 < anchor_x or x0 > x1:
+                continue
+            for y0 in ys:
+                for y1 in ys:
+                    if y0 > anchor_y or y1 < anchor_y or y0 > y1:
+                        continue
+                    records = rectangle(x0, x1, y0, y1)
+                    capacity = _clock_region_capacity(records)
+                    if _capacity_holds(capacity, total):
+                        width = x1 - x0 + 1
+                        height = y1 - y0 + 1
+                        center_distance = abs((x0 + x1) / 2.0 - anchor_x) + abs(
+                            (y0 + y1) / 2.0 - anchor_y
+                        )
+                        critical_coverage = sum(
+                            max(0, int(item.get("critical_cell_count", 0)))
+                            for item in records
+                        )
+                        single_options.append((
+                            max(width, height),
+                            abs(width - height),
+                            len(records),
+                            -critical_coverage,
+                            center_distance,
+                            x0,
+                            y0,
+                            x1,
+                            y1,
+                            capacity,
+                        ))
+    single_options.sort(key=lambda item: item[:9])
+    for ordinal, (_, _, _, _, _, x0, y0, x1, y1, capacity) in enumerate(
+        single_options[: max(0, int(max_single_candidates))], 1
+    ):
+        range_text = _clock_region_range([(x0, y0), (x1, y1)])
+        singles.append({
+            "name": f"clock_aligned_{ordinal}",
+            "kind": "clock_region_single",
+            "range": range_text,
+            "capacity": capacity,
+            "requirements": total,
+        })
+
+    multi_options = []
+    all_x0, all_x1, all_y0, all_y1 = xs[0], xs[-1], ys[0], ys[-1]
+    for cut in xs[:-1]:
+        sides = (
+            (all_x0, cut, all_y0, all_y1),
+            (xs[xs.index(cut) + 1], all_x1, all_y0, all_y1),
+        )
+        critical_side = sides[0] if anchor_x <= cut else sides[1]
+        remainder_side = sides[1] if critical_side == sides[0] else sides[0]
+        multi_options.append(("vertical", cut, critical_side, remainder_side))
+    for cut in ys[:-1]:
+        sides = (
+            (all_x0, all_x1, all_y0, cut),
+            (all_x0, all_x1, ys[ys.index(cut) + 1], all_y1),
+        )
+        critical_side = sides[0] if anchor_y <= cut else sides[1]
+        remainder_side = sides[1] if critical_side == sides[0] else sides[0]
+        multi_options.append(("horizontal", cut, critical_side, remainder_side))
+
+    valid_multi = []
+    for orientation, cut, critical_box, remainder_box in multi_options:
+        critical_records = rectangle(*critical_box)
+        remainder_records = rectangle(*remainder_box)
+        critical_capacity = _clock_region_capacity(critical_records)
+        remainder_capacity = _clock_region_capacity(remainder_records)
+        if not _capacity_holds(critical_capacity, critical):
+            continue
+        if not _capacity_holds(remainder_capacity, remainder):
+            continue
+        critical_range = _clock_region_range(
+            [(critical_box[0], critical_box[2]), (critical_box[1], critical_box[3])]
+        )
+        remainder_range = _clock_region_range(
+            [(remainder_box[0], remainder_box[2]), (remainder_box[1], remainder_box[3])]
+        )
+        if clock_region_ranges_overlap(critical_range, remainder_range):
+            continue
+        valid_multi.append((
+            len(critical_records),
+            orientation,
+            cut,
+            critical_range,
+            remainder_range,
+            critical_capacity,
+            remainder_capacity,
+        ))
+    valid_multi.sort(key=lambda item: item[:5])
+    multis = []
+    for ordinal, item in enumerate(
+        valid_multi[: max(0, int(max_multi_candidates))], 1
+    ):
+        _, orientation, cut, critical_range, remainder_range, critical_capacity, remainder_capacity = item
+        multis.append({
+            "name": f"clock_multiregion_{orientation}_{cut}_{ordinal}",
+            "kind": "clock_region_multi",
+            "regions": [
+                {
+                    "role": "critical",
+                    "range": critical_range,
+                    "capacity": critical_capacity,
+                    "requirements": critical,
+                },
+                {
+                    "role": "remainder",
+                    "range": remainder_range,
+                    "capacity": remainder_capacity,
+                    "requirements": remainder,
+                },
+            ],
+        })
+
+    return {
+        "anchor": {"x": anchor_x, "y": anchor_y},
+        "critical_requirements": critical,
+        "remainder_requirements": remainder,
+        "candidates": [*singles, *multis],
+    }
 
 
 def _normalize_fabric_region(region: dict[str, Any]) -> dict[str, int]:
@@ -429,102 +694,11 @@ def build_fabric_pblock_candidates(
     }
 
 
-def _add_center_window_candidates(
-    candidates: list[dict[str, Any]],
-    seen: set[str],
-    bbox: dict[str, int],
-    bounds: dict[str, int],
-) -> None:
-    """
-    Add generic compact fabric windows in addition to occupied-bbox ranges.
-
-    Some slice-only designs improve when the placer is forced into a fresh
-    central window instead of preserving the current occupied bbox. These
-    windows are derived only from device bounds plus the current bbox center.
-    """
-    device_span_x = bounds["x_max"] - bounds["x_min"]
-    device_span_y = bounds["y_max"] - bounds["y_min"]
-    bbox_span_x = bbox["x_max"] - bbox["x_min"]
-    bbox_span_y = bbox["y_max"] - bbox["y_min"]
-    if device_span_x <= 0 or device_span_y <= 0:
-        return
-
-    has_room_to_rewindow = (
-        device_span_x > bbox_span_x * 1.25
-        or device_span_y > bbox_span_y * 1.25
-    )
-    if not has_room_to_rewindow:
-        return
-
-    window_span_y = max(16, round(device_span_y * 0.65))
-    bbox_center_x = round((bbox["x_min"] + bbox["x_max"]) / 2)
-
-    x_bias = round(device_span_x * 0.02)
-    lower_y_min, lower_y_max = _clamp_window(
-        round(bounds["y_min"] + device_span_y * 0.20),
-        window_span_y,
-        bounds["y_min"],
-        bounds["y_max"],
-    )
-    device_center_y = (bounds["y_min"] + bounds["y_max"]) // 2
-    mid_y_min, mid_y_max = _clamp_window(
-        device_center_y - window_span_y // 2,
-        window_span_y,
-        bounds["y_min"],
-        bounds["y_max"],
-    )
-
-    for fraction, label in ((0.335, "x34"), (0.40, "x40")):
-        window_span_x = max(8, round(device_span_x * fraction))
-        x_min, x_max = _clamp_window(
-            bbox_center_x + x_bias - window_span_x // 2,
-            window_span_x,
-            bounds["x_min"],
-            bounds["x_max"],
-        )
-        _add_candidate(
-            candidates,
-            seen,
-            name=f"slice_center_window_{label}_y65_lower",
-            kind="center_window",
-            x_min=x_min,
-            x_max=x_max,
-            y_min=lower_y_min,
-            y_max=lower_y_max,
-            x_fraction=fraction,
-            y_fraction=0.65,
-            y_anchor="lower",
-            x_center_bias=x_bias,
-        )
-
-    window_span_x = max(8, round(device_span_x * 0.335))
-    x_min, x_max = _clamp_window(
-        bbox_center_x - window_span_x // 2,
-        window_span_x,
-        bounds["x_min"],
-        bounds["x_max"],
-    )
-    _add_candidate(
-        candidates,
-        seen,
-        name="slice_center_window_x34_y65_mid",
-        kind="center_window",
-        x_min=x_min,
-        x_max=x_max,
-        y_min=mid_y_min,
-        y_max=mid_y_max,
-        x_fraction=0.335,
-        y_fraction=0.65,
-        y_anchor="center",
-        x_center_bias=0,
-    )
-
-
 def build_slice_pblock_candidates(
     slice_sites: Iterable[str],
     *,
-    x_paddings: Iterable[int] = (0, 4, 8, 12),
-    y_paddings: Iterable[int] = (0, 16, 32, 48),
+    x_paddings: Iterable[int] = (0,),
+    y_paddings: Iterable[int] = (0,),
     device_bounds: dict[str, int] | None = None,
     max_candidates: int = 8,
 ) -> dict[str, Any]:
@@ -563,7 +737,6 @@ def build_slice_pblock_candidates(
 
     candidates = []
     seen = set()
-    _add_center_window_candidates(candidates, seen, bbox, bounds)
 
     for x_pad, y_pad in zip(x_paddings, y_paddings, strict=False):
         x_min = max(bounds["x_min"], bbox["x_min"] - int(x_pad))

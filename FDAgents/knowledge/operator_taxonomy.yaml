@@ -1,0 +1,202 @@
+schema_version: 1
+authority: generic_operator_taxonomy_only
+contract:
+  purpose: Qualitative vocabulary for classifying timing walls by the semantic scope needed to explain them.
+  limits:
+    - Classification is advisory and supplies no execution authority.
+    - A taxonomy match is a hypothesis until current live evidence supports the local claim.
+    - Missing evidence stays unknown and must not be treated as positive or negative proof.
+    - Physical legality, functional equivalence, timing, and retention are established by current measurements.
+
+levels:
+  - level: L0
+    name: leaf_or_arc
+    recovered_unit: One primitive role, truth-table relation, register-control relation, or locally owned route segment.
+    useful_signals:
+      - A small repeated arc family has the same local role and bounded side effects.
+      - The observed delay remains local after owner and fanout checks.
+    principal_uncertainty: Hidden fanout, an incorrect pin role, or incomplete route ownership can invalidate a leaf explanation.
+
+  - level: L1
+    name: local_cone
+    recovered_unit: A bounded combinational relation between observed sequential boundaries.
+    useful_signals:
+      - Repeated cones share logic shape and observable boundary behavior.
+      - Signedness, truncation, predicates, and controls can be stated explicitly.
+    principal_uncertainty: Similar shape does not prove equivalent semantics or complete boundary coverage.
+
+  - level: L2
+    name: combined_cluster
+    recovered_unit: Several primitive or hard-resource roles that jointly implement one bounded value transformation.
+    useful_signals:
+      - Local leaf roles combine into a stable word-level relation.
+      - Boundary width and alternate-source breadth remain tractable.
+    principal_uncertainty: Primitive roles alone do not establish combined bit weights, control priority, or observable loss.
+
+  - level: L3
+    name: replicated_template
+    recovered_unit: One bounded template repeated across lanes, banks, tiles, or a registered reduction family.
+    useful_signals:
+      - A common template covers a material part of the current wall.
+      - Replica controls and observable boundaries can be compared without assuming uniformity.
+    principal_uncertainty: Cross-replica controls, unequal observability, and broad union boundaries can defeat template transfer.
+
+  - level: L4
+    name: stateful_operator
+    recovered_unit: A recurrence, schedule, handshake transaction, or complete observable state family.
+    useful_signals:
+      - Sequential feedback or protocol state explains repeated critical structure.
+      - Reset, enable, priority, latency, and bubble behavior can be stated as current obligations.
+    principal_uncertainty: Incomplete state or protocol recovery can preserve combinational behavior while changing temporal behavior.
+
+  - level: L5
+    name: subsystem_contract
+    recovered_unit: A broad implementation region with a narrow, explicit sequential or transactional boundary.
+    useful_signals:
+      - Lower-level explanations leave the same coherent boundary dominant.
+      - The externally observable contract is narrower than the internal structure.
+    principal_uncertainty: Proof scope and physical disruption can grow faster than the expected explanatory value.
+
+classification_patterns:
+  - pattern: coherent_repeated_wall
+    interpretation: Repeated local signatures may justify lifting one level only when the lifted boundary is narrower and remains observable.
+  - pattern: sparse_homologous_tail
+    interpretation: A few similar paths do not establish broad family coverage; retain a local or unknown classification.
+  - pattern: mixed_mechanism_wall
+    interpretation: Distinct route, control, memory, and arithmetic mechanisms should be partitioned rather than forced into one operator label.
+  - pattern: route_source_cluster
+    interpretation: Shared launch or route shape without one semantic graph supports measured physical investigation, not semantic rewriting by default.
+  - pattern: broad_alternate_frontier
+    interpretation: A wide alternate-source boundary is evidence against lifting unless a narrower live contract is demonstrated.
+  - pattern: residual_family_shift
+    interpretation: A changed worst family after a retained improvement requires fresh classification of the new residual wall.
+  - pattern: same_family_sparse_residual
+    interpretation: Reduced wall density with a sparse residual can support a lower-scope residual classification without proving complete removal.
+
+registered_directions:
+  - direction_id: constructive_accumulator_rebuild_attempt
+    taxonomy_level: L3
+    evidence_document: operator_action_preflight.json
+    evidence_field: constructive_accumulator_eligible_family_count
+    required_minimum: 1
+    mechanic: operator_rewrite
+    target: constructive_accumulator_rebuild_v1
+    authority: nomination_gated_execution
+    contract:
+      - The public interface is an anonymous closed LUT/CARRY family; names and coefficients remain private recovered facts.
+      - A positive own eligible-family count requires a complete current-seed sibling contract, zero missing obligations, and current top-path overlap; fresh execution reruns cone recovery, canonical ROBDD proof, and all promotion gates.
+      - Unsupported widths, frontiers, side consumers, or expression digests fail typed without fallback.
+      - Old-cone and emitted-topology attestations, strict validation, measured residual profiling, and central retention remain mandatory.
+      - A retained flat candidate is enabling evidence only; it is not an optimization result or promotion authority.
+  - direction_id: memory_write_buffer_forward_attempt
+    taxonomy_level: L4
+    evidence_document: operator_action_preflight.json
+    evidence_field: memory_write_buffer_forward_eligible_family_count
+    required_minimum: 1
+    mechanic: operator_rewrite
+    target: memory_write_buffer_forward_v1
+    authority: nomination_gated_execution
+    contract:
+      - The public interface is an anonymous current-wall memory boundary; primitive and net identities remain private.
+      - A positive own eligible-family count requires a complete current-seed READ_FIRST consumer-closure contract, zero missing obligations, and current hard-memory top-path overlap; fresh execution reruns recovery, proof, and all promotion gates.
+      - The local relational miter, generic binding-derived emitter, reopen boundary audit, and strict validation must pass.
+      - Unsupported port, width, byte-enable, reset, or consumer shapes fail typed without fallback.
+      - Central measurement decides promotion, while a flat local effect may only enter the bounded enabling pool.
+  - direction_id: registered_arithmetic_cone_attempt
+    taxonomy_level: L4
+    evidence_document: operator_action_preflight.json
+    evidence_field: registered_arithmetic_eligible_family_count
+    required_minimum: 1
+    mechanic: operator_rewrite
+    target: registered_arithmetic_cone_v1
+    authority: nomination_gated_execution
+    contract:
+      - The nominated anonymous family must have positive exact live-wall coverage.
+      - Exact word, data, loss, control, schedule, and side-consumer obligations must be complete.
+      - The selected REGARITH_PRODUCT_SUM_V1 or fixed-point proof must be proved and hash-bound to the current seed.
+      - Zero-wall and rejected siblings remain visible but cannot authorize execution.
+      - Fresh recovery, lowering, emitted topology, strict validation, central measurement, and promotion gates remain mandatory.
+  - direction_id: recurrence_boundary_cut_attempt
+    taxonomy_level: L4
+    evidence_document: operator_action_preflight.json
+    evidence_field: recurrence_boundary_hypothesis_count
+    required_minimum: 1
+    mechanic: operator_rewrite
+    target: dsp_srl_recurrence_cut_v1
+    authority: attempt_direction_only
+    contract:
+      - Positive anonymous evidence supports attempting the registered mechanic, not mutation authority.
+      - Eligible means the direction must be assessed, not supported; current timing evidence must independently justify reversible measurement.
+      - Unknown or zero evidence cannot support this direction.
+      - The mechanic must freshly reload the exact incumbent and recover private recurrence facts.
+      - Rewrite authorization, emitted-topology proof, central measurement, lineage, and submission gates remain mandatory.
+  - direction_id: fixed_point_product_rebuild_attempt
+    taxonomy_level: L2
+    evidence_document: operator_action_preflight.json
+    evidence_field: fixed_point_product_hypothesis_count
+    required_minimum: 1
+    mechanic: operator_rewrite
+    target: fixed_point_dsp_rebuild_v1
+    authority: attempt_direction_only
+    contract:
+      - Positive anonymous evidence supports attempting the registered mechanic, not mutation authority.
+      - Eligible means the direction must be assessed, not supported; current timing evidence must independently justify reversible measurement.
+      - Unknown or zero evidence cannot support this direction.
+      - The mechanic must freshly reload the exact incumbent and recover private fixed-point product facts.
+      - Rewrite authorization, emitted-topology proof, central measurement, and submission gates remain mandatory.
+  - direction_id: two_operand_product_rebuild_attempt
+    taxonomy_level: L2
+    evidence_document: operator_action_preflight.json
+    evidence_field: two_operand_product_hypothesis_count
+    required_minimum: 1
+    mechanic: operator_rewrite
+    target: dsp_mul_two_operand_v1
+    authority: attempt_direction_only
+    contract:
+      - Positive anonymous evidence supports attempting the registered mechanic, not mutation authority.
+      - Eligible means the direction must be assessed, not supported; current timing evidence must independently justify reversible measurement.
+      - Unknown or zero evidence cannot support this direction.
+      - The mechanic must freshly reload the exact incumbent and recover private two-operand product facts.
+      - Rewrite authorization, emitted-topology proof, central measurement, and submission gates remain mandatory.
+  - direction_id: register_absorb_attempt
+    taxonomy_level: L0
+    evidence_document: operator_action_preflight.json
+    evidence_field: register_absorb_hypothesis_count
+    required_minimum: 1
+    mechanic: operator_rewrite
+    target: dsp_register_absorb_v1
+    authority: attempt_direction_only
+    contract:
+      - Positive anonymous evidence supports attempting the registered mechanic, not mutation authority.
+      - Eligible means the direction must be assessed, not supported; current timing evidence must independently justify reversible measurement.
+      - Unknown or zero evidence cannot support this direction.
+      - The mechanic must freshly reload the exact incumbent and recover private register-absorb boundary facts.
+      - Rewrite authorization, emitted-topology proof, central measurement, and submission gates remain mandatory.
+  - direction_id: pipeline_rebalance_attempt
+    taxonomy_level: L0
+    evidence_document: operator_action_preflight.json
+    evidence_field: pipeline_rebalance_hypothesis_count
+    required_minimum: 1
+    mechanic: operator_rewrite
+    target: dsp_pipeline_rebalance_v1
+    authority: attempt_direction_only
+    contract:
+      - Positive anonymous evidence supports attempting the registered mechanic, not mutation authority.
+      - Eligible means the direction must be assessed, not supported; current timing evidence must independently justify reversible measurement.
+      - Unknown or zero evidence cannot support this direction.
+      - The mechanic must freshly reload the exact incumbent and recover private pipeline-rebalance boundary facts.
+      - Rewrite authorization, emitted-topology proof, central measurement, and submission gates remain mandatory.
+  - direction_id: recurrence_lineage_worst_source_attempt
+    taxonomy_level: L0
+    evidence_document: semantic_action_preflight.json
+    evidence_field: worst_source_eligible_count
+    required_minimum: 1
+    mechanic: critical_net_reroute
+    target: worst_source
+    authority: attempt_direction_only
+    contract:
+      - One anonymous exact-current source-net result supports a bounded route measurement, not predicted benefit.
+      - Eligible means the direction must be assessed, not supported; current timing evidence must independently justify reversible measurement.
+      - An active recurrence lineage requires every descendant mutation to renew the existing proof.
+      - The mechanic must rediscover one mutable contest-clock source net immediately before mutation.
+      - Central timing, legality, renewed topology proof, equivalence, and retention gates remain mandatory.

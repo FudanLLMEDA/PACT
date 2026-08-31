@@ -21,10 +21,13 @@ per_net_unroute instead.
 from __future__ import annotations
 
 import logging
+import math
 import re
+from pathlib import Path
 from typing import Optional
 
 from .base import (
+    SkillOutput,
     SkillResult,
     calculate_fmax,
     parse_route_status_static,
@@ -82,11 +85,37 @@ def _build_clock_like_net_filter_tcl() -> str:
     )
 
 
-def _build_auto_highfanout_group_tcl(params: dict) -> str:
-    num_paths = max(1, int(params.get("num_paths", 24)))
-    max_nets = max(1, int(params.get("max_nets", 18)))
+def _auto_highfanout_limits(params: dict) -> dict[str, int]:
+    """Keep discovery breadth and mutation breadth independently bounded."""
+    num_paths = max(1, min(int(params.get("num_paths", 24)), 128))
+    base_max_nets = max(1, int(params.get("max_nets", 18)))
+    max_nets_cap = max(1, int(params.get("max_nets_cap", 64)))
+    max_nets = min(max_nets_cap, base_max_nets)
     endpoint_min_fanout = max(1, int(params.get("endpoint_min_fanout", 4)))
-    fallback_min_fanout = max(1, int(params.get("fallback_min_fanout", 64)))
+    fallback_base = max(1, int(params.get("fallback_min_fanout", 64)))
+    fallback_floor = max(1, int(params.get("fallback_min_fanout_floor", 24)))
+    reference_paths = max(1, int(params.get("fanout_reference_paths", 12)))
+    fallback_min_fanout = max(
+        fallback_floor,
+        min(
+            fallback_base,
+            int(math.ceil(fallback_base * reference_paths / num_paths)),
+        ),
+    )
+    return {
+        "num_paths": num_paths,
+        "max_nets": max_nets,
+        "endpoint_min_fanout": endpoint_min_fanout,
+        "fallback_min_fanout": fallback_min_fanout,
+    }
+
+
+def _build_auto_highfanout_group_tcl(params: dict) -> str:
+    limits = _auto_highfanout_limits(params)
+    num_paths = limits["num_paths"]
+    max_nets = limits["max_nets"]
+    endpoint_min_fanout = limits["endpoint_min_fanout"]
+    fallback_min_fanout = limits["fallback_min_fanout"]
     passes = max(1, min(int(params.get("passes", 2)), 4))
     route_directive = str(params.get("route_directive", "NoTimingRelaxation") or "")
     route_tns_cleanup = bool(params.get("route_tns_cleanup", True))
@@ -107,7 +136,12 @@ def _build_auto_highfanout_group_tcl(params: dict) -> str:
         "phys_opt_design -force_replication_on_nets $nets"
         for _ in range(passes)
     ]
-    flow = ["route_design -unroute"]
+    unroute_scope = _normalize_unroute_scope(params.get("unroute_scope", "global"))
+    flow = [
+        "route_design -unroute -nets $nets"
+        if unroute_scope == "net"
+        else "route_design -unroute"
+    ]
     if pre_place_post_place_opt:
         flow.append("place_design -post_place_opt")
     flow.extend(rep_lines)
@@ -125,25 +159,47 @@ def _build_auto_highfanout_group_tcl(params: dict) -> str:
 
     commands.extend([
         _build_clock_like_net_filter_tcl(),
-        "set fdagents_nets {}",
+        "set fdagents_path_nets [dict create]",
         (
             "foreach tp "
             f"[get_timing_paths -quiet -setup -max_paths {num_paths} -nworst 1] "
-            "{ foreach prop {STARTPOINT_PIN ENDPOINT_PIN} { "
-            "set pin [get_property $prop $tp]; "
-            "if {$pin eq \"\"} { continue }; "
-            "foreach n [get_nets -quiet -of_objects $pin] { "
+            "{ set fdagents_path_pins [get_pins -quiet -of_objects $tp]; "
+            "foreach n [get_nets -quiet -of_objects $fdagents_path_pins] { "
             "set nname [get_property NAME $n]; "
             "if {[fdagents_clock_like_net $nname]} { continue }; "
+            "if {$nname eq \"<const0>\" || $nname eq \"<const1>\"} { continue }; "
+            "set fdagents_src_pins [get_pins -quiet -of_objects $n "
+            "-filter {DIRECTION == OUT}]; "
+            "set fdagents_src_cells [get_cells -quiet -of_objects $fdagents_src_pins]; "
+            "set fdagents_ref \"\"; "
+            "if {[llength $fdagents_src_cells] == 1} { "
+            "set fdagents_ref [get_property REF_NAME [lindex $fdagents_src_cells 0]] }; "
+            "if {[regexp -nocase {^(I|O|IO)BUF|^BUFG|^BUFCE|^MMCM|^PLL} "
+            "$fdagents_ref]} { continue }; "
             "set fanout 0; catch {set fanout [get_property FLAT_PIN_COUNT $n]}; "
-            f"if {{$fanout >= {endpoint_min_fanout}}} {{ lappend fdagents_nets $n }} "
-            "} } }"
+            f"if {{$fanout >= {endpoint_min_fanout}}} {{ "
+            "set fdagents_hits 1; "
+            "if {[dict exists $fdagents_path_nets $nname]} { "
+            "set fdagents_prior [dict get $fdagents_path_nets $nname]; "
+            "set fdagents_hits [expr {[lindex $fdagents_prior 1] + 1}] }; "
+            "set fdagents_score [expr {$fanout * $fdagents_hits}]; "
+            "dict set fdagents_path_nets $nname "
+            "[list $fdagents_score $fdagents_hits $fanout $n] } "
+            "} }"
+        ),
+        "set fdagents_ranked [dict values $fdagents_path_nets]",
+        "set fdagents_ranked [lsort -integer -decreasing -index 0 $fdagents_ranked]",
+        "set fdagents_nets {}",
+        (
+            f"foreach fdagents_item [lrange $fdagents_ranked 0 {max_nets - 1}] {{ "
+            "lappend fdagents_nets [lindex $fdagents_item 3] }"
         ),
         (
-            f"if {{[llength $fdagents_nets] < 4}} {{ "
+            "if {[llength $fdagents_nets] == 0} { "
             "foreach n [get_nets -quiet -hierarchical] { "
             "set nname [get_property NAME $n]; "
             "if {[fdagents_clock_like_net $nname]} { continue }; "
+            "if {$nname eq \"<const0>\" || $nname eq \"<const1>\"} { continue }; "
             "set fanout 0; catch {set fanout [get_property FLAT_PIN_COUNT $n]}; "
             f"if {{$fanout >= {fallback_min_fanout}}} {{ lappend fdagents_nets $n }}; "
             f"if {{[llength $fdagents_nets] >= {max_nets}}} {{ break }} "
@@ -208,7 +264,30 @@ class ForceReplicateSkill:
             )
 
         try:
-            if str(target) == "auto_highfanout_group":
+            if str(target) in {"auto", "auto_highfanout_group"}:
+                max_nets_candidates = params.get("max_nets_candidates")
+                route_directives = params.get("route_directives")
+                unroute_scope_candidates = params.get("unroute_scope_candidates")
+                if isinstance(max_nets_candidates, (list, tuple)) and (
+                    len(max_nets_candidates) > 1
+                    or isinstance(route_directives, (list, tuple))
+                    and len(route_directives) > 1
+                    or isinstance(unroute_scope_candidates, (list, tuple))
+                    and len(unroute_scope_candidates) > 1
+                ):
+                    return await self._execute_auto_sweep(
+                        mcp,
+                        target=target,
+                        params=params,
+                        before_wns=before_wns,
+                        clock_period=clock_period,
+                        output_dcp=output_dcp,
+                    )
+            # ``auto`` is the public generic target emitted by Luna.  Keep it
+            # bound to the same action fingerprint, but implement it with the
+            # existing live timing-path net selector instead of treating the
+            # word "auto" as a literal Vivado net name.
+            if str(target) in {"auto", "auto_highfanout_group"}:
                 tcl = _build_auto_highfanout_group_tcl(params)
             else:
                 rep_lines = "\n".join(
@@ -310,7 +389,7 @@ class ForceReplicateSkill:
 
             rs = await mcp.call_vivado("report_route_status", {}, timeout=120.0)
             route = parse_route_status_static(rs)
-            is_legal = bool(route.get("routed_ok", True))
+            is_legal = bool(route.get("routed_ok"))
 
             after_wns = await mcp.get_wns()
             if after_wns is None:
@@ -319,14 +398,15 @@ class ForceReplicateSkill:
                 after_wns = parsed.get("wns") or before_wns
 
             delta = after_wns - before_wns
-            if delta > 0.001:
-                await mcp.call_vivado(
-                    "write_checkpoint",
-                    {"dcp_path": str(output_dcp.resolve()), "force": True},
-                    timeout=600.0,
+            if not is_legal:
+                return SkillResult.failure(
+                    before_wns, "candidate is not fully routed", output_dcp
                 )
-            else:
-                output_dcp = run_dir / "current.dcp"
+            await mcp.call_vivado(
+                "write_checkpoint",
+                {"dcp_path": str(output_dcp.resolve()), "force": True},
+                timeout=600.0,
+            )
 
             fmax_b = calculate_fmax(before_wns, clock_period)
             fmax_a = calculate_fmax(after_wns, clock_period)
@@ -356,3 +436,176 @@ class ForceReplicateSkill:
         except Exception as e:
             logger.error("[force_replicate] %s failed: %s", target, e)
             return SkillResult.failure(before_wns, str(e), output_dcp)
+
+    async def _execute_auto_sweep(
+        self,
+        mcp,
+        *,
+        target: str,
+        params: dict,
+        before_wns: float,
+        clock_period: Optional[float],
+        output_dcp: Path,
+    ) -> SkillResult:
+        """Race bounded live-profile breadth siblings from one current seed."""
+        current_dcp = Path(
+            params.get("input_dcp") or mcp.run_dir / "current_best.dcp"
+        )
+        if not current_dcp.exists():
+            await mcp.call_vivado(
+                "write_checkpoint",
+                {"dcp_path": str(current_dcp.resolve()), "force": True},
+                timeout=600.0,
+            )
+
+        raw_counts = params.get("max_nets_candidates") or [params.get("max_nets", 1)]
+        counts = []
+        for value in raw_counts:
+            count = max(1, min(64, int(value)))
+            if count not in counts:
+                counts.append(count)
+        raw_directives = params.get("route_directives") or [
+            params.get("route_directive", "AggressiveExplore")
+        ]
+        directives = []
+        for value in raw_directives:
+            directive = str(value or "")
+            if directive not in directives:
+                directives.append(directive)
+        raw_scopes = params.get("unroute_scope_candidates") or [
+            params.get("unroute_scope", "global")
+        ]
+        scopes = []
+        for value in raw_scopes:
+            scope = _normalize_unroute_scope(value)
+            if scope not in scopes:
+                scopes.append(scope)
+
+        attempts = []
+        candidates = []
+        best_wns = None
+        best_label = ""
+        variant_index = 0
+        for scope in scopes:
+            # The selective sibling tests only the smallest independently
+            # derived owner set. Broad count siblings retain the global flow.
+            scope_counts = counts[:1] if scope == "net" else counts
+            for max_nets in scope_counts:
+                for directive in directives:
+                    variant_index += 1
+                    label = (
+                        f"force_replicate scope={scope} nets={max_nets} "
+                        f"route={directive or 'Default'}"
+                    )
+                    candidate_dcp = (
+                        mcp.run_dir / f"force_replicate_auto_{variant_index:02d}.dcp"
+                    )
+                    candidate_params = dict(params)
+                    candidate_params["max_nets"] = max_nets
+                    candidate_params["route_directive"] = directive
+                    candidate_params["unroute_scope"] = scope
+                    if scope == "net":
+                        candidate_params.update({
+                            "pre_place_post_place_opt": False,
+                            "post_rep_phys_opt": "",
+                            "final_phys_opt": "",
+                            "final_route": False,
+                        })
+                    logger.info("[force_replicate] sibling %s", label)
+                    try:
+                        await mcp.call_vivado(
+                            "open_checkpoint",
+                            {"dcp_path": str(current_dcp.resolve())},
+                            timeout=600.0,
+                        )
+                        await mcp.call_vivado(
+                            "run_tcl",
+                            {
+                                "command": _build_auto_highfanout_group_tcl(
+                                    candidate_params
+                                ),
+                                "timeout": 3600,
+                            },
+                            timeout=3900.0,
+                        )
+                        rs = await mcp.call_vivado(
+                            "report_route_status", {}, timeout=120.0
+                        )
+                        route = parse_route_status_static(rs)
+                        is_legal = bool(route.get("routed_ok"))
+                        after_wns = await mcp.get_wns()
+                        if after_wns is None:
+                            ts = await mcp.call_vivado(
+                                "report_timing_summary", {}, timeout=300.0
+                            )
+                            after_wns = (
+                                parse_timing_summary_static(ts).get("wns")
+                                or before_wns
+                            )
+                        attempts.append(
+                            {
+                                "label": label,
+                                "legal": is_legal,
+                                "wns": after_wns,
+                                "delta_wns": after_wns - before_wns,
+                            }
+                        )
+                        if not is_legal:
+                            continue
+                        await mcp.call_vivado(
+                            "write_checkpoint", {
+                                "dcp_path": str(candidate_dcp.resolve()),
+                                "force": True,
+                            },
+                            timeout=600.0,
+                        )
+                        candidates.append(SkillOutput(candidate_dcp, label))
+                        if best_wns is None or after_wns > best_wns:
+                            best_wns = after_wns
+                            best_label = label
+                            await mcp.call_vivado(
+                                "write_checkpoint", {
+                                    "dcp_path": str(output_dcp.resolve()),
+                                    "force": True,
+                                },
+                                timeout=600.0,
+                            )
+                    except Exception as exc:
+                        attempts.append({"label": label, "error": str(exc)})
+
+        if best_wns is None:
+            return SkillResult.failure(
+                before_wns,
+                "no legal force-replication sibling routed successfully",
+                output_dcp,
+                details={"attempts": attempts},
+            )
+        await mcp.call_vivado(
+            "open_checkpoint",
+            {"dcp_path": str(output_dcp.resolve())},
+            timeout=600.0,
+        )
+        delta = best_wns - before_wns
+        fmax_before = calculate_fmax(before_wns, clock_period)
+        fmax_after = calculate_fmax(best_wns, clock_period)
+        summary = (
+            f"force_replicate:{target} best={best_label} "
+            f"wns {before_wns:.3f}->{best_wns:.3f} "
+            f"fmax {fmax_before:.1f}->{fmax_after:.1f} MHz delta={delta:+.3f}"
+            if fmax_before and fmax_after
+            else (
+                f"force_replicate:{target} best={best_label} "
+                f"wns {before_wns:.3f}->{best_wns:.3f} delta={delta:+.3f}"
+            )
+        )
+        return SkillResult(
+            success=True,
+            before_wns=before_wns,
+            after_wns=best_wns,
+            delta_wns=delta,
+            is_legal=True,
+            output_dcp=output_dcp,
+            summary=summary,
+            details={"attempts": attempts},
+            candidates=tuple(candidates),
+        )

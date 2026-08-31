@@ -15,9 +15,16 @@ from .critical_net_reroute import CriticalNetRerouteSkill
 from .critical_cluster_anchor import CriticalClusterAnchorSkill
 from .fresh_place_route import FreshPlaceRouteSkill
 from .endpoint_bel_move import EndpointBelMoveSkill
+from .hard_macro_move import HardMacroMoveSkill
 from .clock_tighten import ClockTightenSkill
 from .path_local_lut_reflow import PathLocalLutReflowSkill
 from .custom import CustomSkill
+from .implementation_recipe import ImplementationRecipeSkill
+from .selective_branch_reroute import SelectiveBranchRerouteSkill
+from .structure_relocation import StructureRelocationSkill
+from .equivalent_source_remap import EquivalentSourceRemapSkill
+from .operator_rewrite import OperatorRewriteSkill
+from .semantic_replay import SemanticReplaySkill
 
 SKILLS = {
     "phys_opt": PhysOptSkill(),
@@ -35,9 +42,16 @@ SKILLS = {
     "critical_cluster_anchor": CriticalClusterAnchorSkill(),
     "fresh_place_route": FreshPlaceRouteSkill(),
     "endpoint_bel_move": EndpointBelMoveSkill(),
+    "hard_macro_move": HardMacroMoveSkill(),
     "clock_tighten": ClockTightenSkill(),
     "path_local_lut_reflow": PathLocalLutReflowSkill(),
     "custom": CustomSkill(),
+    "implementation_recipe": ImplementationRecipeSkill(),
+    "selective_branch_reroute": SelectiveBranchRerouteSkill(),
+    "structure_relocation": StructureRelocationSkill(),
+    "equivalent_source_remap": EquivalentSourceRemapSkill(),
+    "operator_rewrite": OperatorRewriteSkill(),
+    "semantic_replay": SemanticReplaySkill(),
 }
 
 # Skills that can only be chosen while deep-analysis mode is active.
@@ -63,7 +77,14 @@ __all__ = [
     "CriticalClusterAnchorSkill",
     "FreshPlaceRouteSkill",
     "EndpointBelMoveSkill",
+    "HardMacroMoveSkill",
     "ClockTightenSkill",
     "PathLocalLutReflowSkill",
     "CustomSkill",
+    "ImplementationRecipeSkill",
+    "SelectiveBranchRerouteSkill",
+    "StructureRelocationSkill",
+    "EquivalentSourceRemapSkill",
+    "OperatorRewriteSkill",
+    "SemanticReplaySkill",
 ]

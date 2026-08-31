@@ -1,12 +1,26 @@
 # Makefile for FPGA Design Optimization Agent
 
 # Configuration
-PYTHON := python3
-PIP := $(PYTHON) -m pip
+UV_VERSION := 0.11.28
+PYTHON_VERSION := 3.13.14
+UV_BIN_DIR := $(CURDIR)/.uv-bin
+UV := $(UV_BIN_DIR)/uv
+VENV_DIR := $(CURDIR)/.venv
+PYTHON := $(VENV_DIR)/bin/python
+export PATH := $(VENV_DIR)/bin:$(PATH)
+export PYTHONNOUSERSITE := 1
+AGENT_EXTRA_ARGS ?=
 
 # Vivado executable - can be overridden with: make setup VIVADO_EXEC=/path/to/vivado
 VIVADO_EXEC ?= vivado
 export VIVADO_EXEC
+FDAGENTS_VIVADO_BIN ?= $(VIVADO_EXEC)
+export FDAGENTS_VIVADO_BIN
+
+# Vitis HLS is needed only when an exact source-bound HLS replay is selected.
+VITIS_HLS_EXEC ?= vitis-run
+FDAGENTS_VITIS_HLS_BIN ?= $(VITIS_HLS_EXEC)
+export FDAGENTS_VITIS_HLS_BIN
 
 # Set JAVA_HOME from PATH or Vivado if not already set
 # Python RapidWright may need JAVA_HOME to be set, but often users only have `java` on PATH
@@ -42,7 +56,7 @@ export RAPIDWRIGHT_PATH
 export CLASSPATH := $(RAPIDWRIGHT_PATH)/bin:$(RAPIDWRIGHT_PATH)/jars/*
 
 # Benchmark archive from GitHub release
-BENCHMARK_VERSION := v1.1.0
+BENCHMARK_VERSION := v1.2.0
 BENCHMARK_TARBALL := fpl26_contest_benchmarks_$(BENCHMARK_VERSION).tar.gz
 BENCHMARK_DIR := fpl26_contest_benchmarks
 BENCHMARK_URL := https://github.com/Xilinx/fpl26_optimization_contest/releases/download/$(BENCHMARK_VERSION)/$(BENCHMARK_TARBALL)
@@ -63,7 +77,7 @@ COLOR_RED := \033[0;31m
 COLOR_BLUE := \033[0;34m
 COLOR_RESET := \033[0m
 
-.PHONY: setup build-rapidwright run_optimizer run_test validate validate_demo run-submission clean veryclean help
+.PHONY: setup python-env check build-rapidwright run_optimizer run_test validate validate_demo run-submission clean veryclean help
 
 # Default target
 help:
@@ -71,9 +85,12 @@ help:
 	@echo ""
 	@echo "Available targets:"
 	@echo "  setup              - Install dependencies, build RapidWright, download example DCPs"
+	@echo "  python-env         - Create the locked Python 3.13.14 environment with uv"
+	@echo "  check              - Compile and import public Python sources"
 	@echo "  build-rapidwright  - Build RapidWright from source (git submodule)"
 	@echo "  run_optimizer      - Run optimizer on a DCP file (LLM-guided, requires API key)"
-	@echo "  run_test           - Run optimizer in test mode (no LLM, hardcoded optimization)"
+	@echo "  run-submission     - Run strict 3600s staged ReAct submission flow"
+	@echo "  run_test           - Run FDAgents in fallback mode (no LLM required)"
 	@echo "  validate           - Validate functional equivalence between two DCPs"
 	@echo "  validate_demo      - Run validation demo (self-check)"
 	@echo "  clean              - Remove generated files (run directories, logs, Vivado outputs)"
@@ -83,6 +100,7 @@ help:
 	@echo "  make setup"
 	@echo "  make setup VIVADO_EXEC=/tools/Xilinx/Vivado/2025.2/bin/vivado"
 	@echo "  make run_optimizer DCP=fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp"
+	@echo "  make run-submission DCP=fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp"
 	@echo "  make run_test DCP=fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp"
 	@echo "  make run_test DCP=fpl26_contest_benchmarks/vexriscv_re-place_2025.1.dcp"
 	@echo "  make validate GOLDEN=design.dcp REVISED=design_optimized.dcp"
@@ -92,8 +110,12 @@ help:
 	@echo ""
 	@echo "Environment variables:"
 	@echo "  VIVADO_EXEC     - Path to Vivado executable (default: vivado)"
+	@echo "  VITIS_HLS_EXEC  - Path to vitis-run for source-bound HLS replay (default: vitis-run)"
 	@echo "  JAVA_HOME       - Java installation directory (auto-detected from PATH if not set)"
 	@echo "  DCP             - Input DCP file for run_optimizer / run_test targets"
+	@echo "  INPUT_DCP       - Alias for DCP, accepted by run_optimizer / run-submission"
+	@echo "  OUTPUT_DCP      - Optional output DCP path passed to the optimizer"
+	@echo "  OUTPUT_DCP_PATH - Alias for OUTPUT_DCP"
 	@echo "  MAX_NETS        - Max high fanout nets to optimize in test mode (default: 5)"
 	@echo "  GOLDEN          - Golden (reference) DCP for validation"
 	@echo "  REVISED         - Revised (optimized) DCP for validation"
@@ -101,8 +123,31 @@ help:
 	@echo ""
 	@echo "Output structure:"
 	@echo "  - Optimized DCP: <input_name>_optimized-<timestamp>.dcp (next to input)"
-	@echo "  - Run directory: dcp_optimizer_run-<timestamp>/ (contains all logs)"
+	@echo "  - Run directory: fdagents_run-<timestamp>/ (contains all logs)"
 	@echo "  - Validation:    /tmp/dcp_validation_*/ (contains simulation logs)"
+
+# Install one pinned uv release locally so setup does not depend on system Python.
+$(UV):
+	@mkdir -p "$(UV_BIN_DIR)"
+	@if command -v curl >/dev/null 2>&1; then \
+		curl -LsSf "https://astral.sh/uv/$(UV_VERSION)/install.sh" -o "$(UV_BIN_DIR)/install.sh"; \
+	elif command -v wget >/dev/null 2>&1; then \
+		wget -qO "$(UV_BIN_DIR)/install.sh" "https://astral.sh/uv/$(UV_VERSION)/install.sh"; \
+	else \
+		echo "Error: curl or wget is required to install uv"; \
+		exit 1; \
+	fi
+	@UV_INSTALL_DIR="$(UV_BIN_DIR)" UV_NO_MODIFY_PATH=1 sh "$(UV_BIN_DIR)/install.sh"
+	@rm -f "$(UV_BIN_DIR)/install.sh"
+
+python-env: $(UV)
+	$(UV) sync --frozen --no-dev --python "$(PYTHON_VERSION)"
+	@$(PYTHON) -c 'import sys; assert sys.version_info[:3] == (3, 13, 14), sys.version'
+
+# Lightweight public-source gate; does not invoke FPGA tools or require keys.
+check:
+	$(PYTHON) -m compileall -q FDAgents RapidWrightMCP VivadoMCP validate_dcps.py
+	$(PYTHON) -c 'from FDAgents.config import load_config; from FDAgents.llm import LLMClient; assert load_config().get("run.time_limit_s") > 0; assert LLMClient'
 
 # Setup target: Install dependencies, check Vivado, set up Java, build RapidWright, download DCPs
 setup:
@@ -110,7 +155,7 @@ setup:
 	@echo ""
 	
 	@printf "$(COLOR_YELLOW)[1/5] Installing Python dependencies...$(COLOR_RESET)\n"
-	$(PIP) install -r requirements.txt
+	@$(MAKE) --no-print-directory python-env
 	@printf "$(COLOR_GREEN)✓ Python dependencies installed$(COLOR_RESET)\n"
 	@echo ""
 	
@@ -213,7 +258,7 @@ setup:
 	@echo ""
 	@echo "Output will be in:"
 	@echo "  - Optimized DCP: <input_name>_optimized-<timestamp>.dcp"
-	@echo "  - Run logs: dcp_optimizer_run-<timestamp>/"
+	@echo "  - Run logs: fdagents_run-<timestamp>/"
 	@echo ""
 
 # Build RapidWright from source (git submodule)
@@ -228,18 +273,22 @@ build-rapidwright:
 	@printf "$(COLOR_GREEN)  RAPIDWRIGHT_PATH=$(RAPIDWRIGHT_PATH)$(COLOR_RESET)\n"
 	@printf "$(COLOR_GREEN)  CLASSPATH=$(CLASSPATH)$(COLOR_RESET)\n"
 
-# Run optimizer target: Run dcp_optimizer.py (output DCP name generated automatically)
+# Run optimizer target: Run FDAgents agent (output DCP name generated automatically)
 run_optimizer: 
-	@if [ -z "$(DCP)" ]; then \
+	@INPUT_DCP_PATH="$(DCP)"; \
+	if [ -z "$$INPUT_DCP_PATH" ]; then INPUT_DCP_PATH="$(INPUT_DCP)"; fi; \
+	if [ -z "$$INPUT_DCP_PATH" ]; then \
 		printf "$(COLOR_RED)Error: DCP variable not set$(COLOR_RESET)\n"; \
-		echo "Usage: make run_optimizer DCP=input.dcp"; \
+		echo "Usage: make run_optimizer DCP=input.dcp [OUTPUT_DCP=output.dcp]"; \
+		exit 1; \
+	fi; \
+	if [ ! -f "$$INPUT_DCP_PATH" ]; then \
+		printf "$(COLOR_RED)Error: DCP file not found: %s$(COLOR_RESET)\n" "$$INPUT_DCP_PATH"; \
 		exit 1; \
 	fi
-	@if [ ! -f "$(DCP)" ]; then \
-		printf "$(COLOR_RED)Error: DCP file not found: $(DCP)$(COLOR_RESET)\n"; \
-		exit 1; \
-	fi
-	@printf "$(COLOR_GREEN)Running optimizer on $(DCP)...$(COLOR_RESET)\n"
+	@INPUT_DCP_PATH="$(DCP)"; \
+	if [ -z "$$INPUT_DCP_PATH" ]; then INPUT_DCP_PATH="$(INPUT_DCP)"; fi; \
+	printf "$(COLOR_GREEN)Running FDAgents optimizer on %s...$(COLOR_RESET)\n" "$$INPUT_DCP_PATH"
 	@# Set up Java from Vivado if Java is not available
 	@if ! command -v java >/dev/null 2>&1; then \
 		printf "$(COLOR_YELLOW)Java not found on PATH, attempting to use Java from Vivado...$(COLOR_RESET)\n"; \
@@ -257,17 +306,27 @@ run_optimizer:
 		fi; \
 	fi; \
 	echo ""; \
-	$(PYTHON) dcp_optimizer.py "$(DCP)" 
+	INPUT_DCP_PATH="$(DCP)"; \
+	if [ -z "$$INPUT_DCP_PATH" ]; then INPUT_DCP_PATH="$(INPUT_DCP)"; fi; \
+	OUTPUT_DCP_PATH="$(OUTPUT_DCP)"; \
+	if [ -z "$$OUTPUT_DCP_PATH" ]; then OUTPUT_DCP_PATH="$(OUTPUT_DCP_PATH)"; fi; \
+	if [ -z "$$OUTPUT_DCP_PATH" ]; then OUTPUT_DCP_PATH="$(OUT_DCP)"; fi; \
+	if [ -z "$$OUTPUT_DCP_PATH" ]; then OUTPUT_DCP_PATH="$(OUTPUT)"; fi; \
+	if [ -n "$$OUTPUT_DCP_PATH" ]; then \
+		$(PYTHON) -m FDAgents.agent "$$INPUT_DCP_PATH" --output "$$OUTPUT_DCP_PATH" --submission $(AGENT_EXTRA_ARGS); \
+	else \
+		$(PYTHON) -m FDAgents.agent "$$INPUT_DCP_PATH" --submission $(AGENT_EXTRA_ARGS); \
+	fi
 
-# Run test mode: Run dcp_optimizer.py with --test flag (no LLM required)
+# Run test mode: FDAgents fallback-plan mode (no LLM required)
 run_test:
 	@if [ -z "$(DCP)" ]; then \
 		printf "$(COLOR_RED)Error: DCP variable not set$(COLOR_RESET)\n"; \
 		echo "Usage: make run_test DCP=input.dcp"; \
 		echo ""; \
 		echo "Supported example DCPs:"; \
-		echo "  make run_test DCP=fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp      # Pblock optimization"; \
-		echo "  make run_test DCP=fpl26_contest_benchmarks/vexriscv_re-place_2025.1.dcp   # Cell re-placement"; \
+		echo "  make run_test DCP=fpl26_contest_benchmarks/logicnets_jscl_2025.1.dcp"; \
+		echo "  make run_test DCP=fpl26_contest_benchmarks/vexriscv_re-place_2025.1.dcp"; \
 		exit 1; \
 	fi
 	@if [ ! -f "$(DCP)" ]; then \
@@ -292,7 +351,7 @@ run_test:
 		fi; \
 	fi; \
 	echo ""; \
-	$(PYTHON) dcp_optimizer.py "$(DCP)" --test $(if $(MAX_NETS),--max-nets $(MAX_NETS))
+	$(PYTHON) -m FDAgents.agent "$(DCP)" --no-llm
 
 # Validation target: Validate functional equivalence between two DCPs
 validate:
@@ -346,7 +405,7 @@ validate_demo:
 	@echo "This demo validates a DCP against itself (should always PASS)."
 	@echo "For real validation, first optimize a design, then validate:"
 	@echo ""
-	@echo "  1. python dcp_optimizer.py design.dcp --output design_optimized.dcp"
+	@echo "  1. python -m FDAgents.agent design.dcp --output design_optimized.dcp"
 	@echo "  2. make validate GOLDEN=design.dcp REVISED=design_optimized.dcp"
 	@echo ""
 	@# Check if example DCP exists
@@ -359,8 +418,8 @@ validate_demo:
 	@echo ""
 	$(PYTHON) validate_dcps.py "$(EXAMPLE_DCP_2)" "$(EXAMPLE_DCP_2)" --vectors 1000
 
-run-submission:
-	@echo "Running submission...[Will be implemented later]"
+run-submission: override AGENT_EXTRA_ARGS := --time-limit 3600
+run-submission: run_optimizer
 	
 # Clean target: Remove run directories and Vivado-generated .Xil directories
 clean:

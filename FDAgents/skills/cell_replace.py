@@ -9,7 +9,13 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from .base import SkillResult, parse_timing_summary_static, parse_route_status_static, calculate_fmax
+from .base import (
+    SkillResult,
+    calculate_fmax,
+    open_rapidwright_dcp_in_vivado,
+    parse_route_status_static,
+    parse_timing_summary_static,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,11 +116,7 @@ class CellReplaceSkill:
                 return SkillResult.failure(before_wns, "RapidWright DCP not created", output_dcp)
 
             # Step 4: Open optimized DCP in Vivado and route
-            await mcp.call_vivado(
-                "open_checkpoint",
-                {"dcp_path": str(rw_dcp)},
-                timeout=600.0,
-            )
+            await open_rapidwright_dcp_in_vivado(mcp, rw_dcp, timeout=600.0)
 
             await mcp.call_vivado(
                 "route_design",

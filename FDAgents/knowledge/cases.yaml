@@ -1,0 +1,799 @@
+# ============================================================================
+# FDAgents case library.
+#
+# Every case describes ONE design profile that we have real experience with,
+# what worked, and the measured outcome. Signatures are SOFT feature ranges
+# over FDAgents.features.DesignFeatures fields (normalized where possible)
+# — they rank which cases the LLM gets shown, they do not gate anything.
+#
+# Signature spec:
+#   <feature>: {min: x}| {max: y}| {min: x, max: y}   numeric range (soft edges)
+#   <feature>: true|false                             boolean equality
+#   bottleneck_any: [fanout, routing]                 substring match on
+#                                                     dominant_bottleneck
+#
+# Evidence entries are verified route-clean results (independent Vivado
+# reopen) from the historical evaluation corpus unless noted otherwise.
+# ============================================================================
+
+- id: EXTREME_CLOCK_PRESSURE_REPLACE_ROUTE
+  description: >
+    The official contest period is many times tighter than the achieved routed
+    period on a low-utilization, deep-logic hard-macro design. Run a fresh
+    place/route under one realistic temporary pressure period FIRST, then
+    restore the exact official XDC before measuring and writing the candidate.
+    Do not spend the bounded run on repeated replication or pblock attempts
+    before this pressure candidate.
+  signature:
+    closure_ratio: {max: -4.0}
+    lut_util_pct: {max: 30}
+    hard_macro_present: true
+    max_logic_levels: {min: 20}
+  confidence: 0.98
+  bottleneck: mixed
+  suggested_skill_order: [implementation_recipe, force_replicate, phys_opt, post_route_cleanup, critical_net_reroute, pblock]
+  core_skills: [implementation_recipe]
+  budget_hint_s: 2400
+  initial_params:
+    implementation_recipe:
+      target_candidates: [derived_pressure_replace_route_v1]
+      replace_target_candidates: true
+  evidence:
+    - benchmark: vtr_mcml_v2
+      baseline_mhz: 69.334
+      achieved_mhz: 75.047
+      note: >
+        ExtraTimingOpt under a 12.5 ns temporary optimization period produced
+        a fully routed candidate with WNS -11.787 ns after the official 1.538
+        ns XDC was restored. The fixed implementation_recipe target independently
+        reproduced the exact 75.046904 MHz result from the immutable root in
+        1392s; structural 3/3 plus 100/1000-cycle xsim passed with zero mismatch.
+
+- id: TIMING_PRESERVING_ROUTE_CLEANUP
+  description: >
+    A large gap between pre-route and routed Fmax means the router gave away
+    timing that placement already achieved. Route-preserving cleanup
+    (post_route_cleanup, critical_net_reroute, endpoint_bel_move) recovers it
+    without risking the placement.
+  signature:
+    pre_route_to_routed_gap_mhz: {min: 5.0}
+  confidence: 0.90
+  bottleneck: routing
+  suggested_skill_order: [post_route_cleanup, critical_net_reroute, endpoint_bel_move, fresh_place_route, phys_opt, pblock, pblock_sweep]
+  core_skills: [post_route_cleanup, critical_net_reroute, endpoint_bel_move]
+  budget_hint_s: 1800
+  initial_params:
+    fresh_place_route:
+      recipes: [extranetdelay_no_relax]
+      max_candidates: 1
+    endpoint_bel_move: {num_paths: 20, max_candidates: 6}
+  evidence:
+    - benchmark: rosetta_spam-filter
+      baseline_mhz: 437.445
+      achieved_mhz: 455.166
+      note: >
+        guidance pblock seed (439.56) -> fresh extranetdelay_no_relax +
+        same-site endpoint HFF->HFF2 move -> 455.17, route-clean verified.
+        Pre-route was seen at 477-496 MHz: the bottleneck is keeping
+        pre-route quality through routing.
+    - benchmark: rosetta_spam-filter
+      baseline_mhz: 437.445
+      achieved_mhz: 437.64
+      note: >
+        v3 autonomous run (2026-07-20, $0.13, 3362s) was a negative-control:
+        one guidance pblock seed and one fresh route both regressed, and an
+        endpoint BEL move recovered only +0.001 ns. This profile is
+        seed-sensitive; preserve enough budget to retry the proven pblock ->
+        fresh route -> endpoint sequence rather than polishing the original
+        placement after the first seed fails.
+
+- id: LOW_UTIL_ROUTE_FANOUT_FLOORPLAN
+  description: >
+    Low-utilization, route/fanout-dominated fabric-only design (LogicNets
+    style). A slice floorplan seed (pblock_sweep) FIRST compacts the design;
+    replication and route polish afterwards act on the improved geometry.
+    Order matters: pblock before mass replication.
+  signature:
+    lut_util_pct: {max: 30}
+    hard_macro_present: false
+    closure_ratio: {max: 0.0}
+    max_actionable_fanout: {min: 96}
+    avg_route_pct: {min: 65}
+    route_dominated_ratio: {min: 0.65}
+    broad_hf_count: {max: 10}
+  confidence: 0.90
+  bottleneck: placement
+  suggested_skill_order: [pblock_sweep, fanout_opt, critical_net_reroute, post_route_cleanup, lut_pin_swap, phys_opt, force_replicate, fresh_place_route, pblock]
+  core_skills: [pblock_sweep]
+  budget_hint_s: 3600
+  initial_params:
+    pblock_sweep: {max_candidates: 1}
+    fanout_opt: {split_factor: 3, accept_min_delta_ns: 0.008}
+    force_replicate:
+      passes: 2
+      unroute_scope: global
+      pre_place_post_place_opt: true
+      route_directive: NoTimingRelaxation
+      route_tns_cleanup: true
+      post_rep_phys_opt: AggressiveFanoutOpt
+      final_phys_opt: Explore
+      final_route: false
+    lut_pin_swap:
+      route_directives: [AggressiveExplore, HigherDelayCost]
+      max_pins: 8
+      max_cells: 3
+      max_iterations: 2
+    post_route_cleanup:
+      target_candidates: [pre_lut_directive, post_lut_cleanup]
+      replace_target_candidates: true
+      target_params:
+        pre_lut_directive:
+          recipes: [phys_explore, route_aggr_phys_explore, route_higher_tns_phys_explore]
+          max_candidates: 3
+          max_iterations: 2
+          min_remaining_s: 1200
+          recipe_timeout_s: 900
+        post_lut_cleanup:
+          recipes: [route_higher_tns_phys_explore]
+          max_candidates: 1
+          max_iterations: 1
+          recipe_timeout_s: 900
+    critical_net_reroute:
+      target_candidates: [worst_source, early_window, high_delay10, top3_final]
+      replace_target_candidates: true
+      target_params:
+        worst_source:
+          selection_mode: worst_source
+          route_mode: explore_group
+          post_phys_opt: null
+          pressure_path_count: 0
+          pressure_value_ns: null
+          num_paths: 1
+          max_candidates: 1
+          max_fanout: 256
+          route_timeout_s: 900
+        early_window:
+          route_mode: explore_group
+          post_phys_opt: Explore
+          num_paths: 1
+          max_candidates: 3
+          max_fanout: 256
+          route_timeout_s: 900
+        high_delay10:
+          selection_mode: high_delay
+          route_mode: explore_group
+          post_phys_opt: Explore
+          num_paths: 3
+          max_nets: 10
+          max_fanout: 512
+          route_timeout_s: 900
+        top3_final:
+          selection_mode: top3
+          route_mode: explore_group
+          post_phys_opt: Explore
+          num_paths: 1
+          max_nets: 3
+          max_fanout: 512
+          route_timeout_s: 900
+    phys_opt:
+      target_candidates: [Explore, AggressiveExplore, AddRetime, Default]
+      replace_target_candidates: true
+  evidence:
+    - benchmark: logicnets_jscl
+      baseline_mhz: 403.551
+      achieved_mhz: 554.017
+      note: >
+        pblock first -> 484.7 MHz; targeted replicate/fanout on the NEW
+        timing after floorplan -> 504.8; best verified 554.017. Baseline
+        agent reference was 434.97. Mining rows at 724 MHz were NOT
+        route-clean and do not count.
+    - benchmark: logicnets_jscl
+      baseline_mhz: 403.551
+      achieved_mhz: 535.91
+      note: >
+        v3 autonomous run (2026-07-20, $0.13, 3020s), independently reopened:
+        one pblock_sweep gave 513.87, grouped replication reached 526.04,
+        then route_aggr_phys_explore cleanup reached 535.91. Individual
+        fanout split, plain phys_opt, fresh route, and local reroute regressed.
+  notes: >
+    Near closure on this profile, follow the staged polish: pre-LUT cleanup
+    (phys/route directives) while |WNS| is within roughly 8% of the clock
+    period, then LUT pin swaps, then post-LUT cleanup, then surgical
+    per-net reroute of the top offenders. Low-yield accepted deltas
+    (<0.005 ns) usually mean switch strategy, not grind.
+
+- id: HIGH_UTIL_DEEP_SLACK_MECHANISM_TRIAGE
+  description: >
+    A high-utilization design with hard macros, deep negative setup slack,
+    substantial logic depth, and route/fanout-dominated critical paths needs
+    a basin-level decision. Compare a fresh full implementation under
+    evidence-derived timing pressure with localized physical optimization and
+    any operator reconstruction whose current-seed semantic contract closes.
+    The live wall and routed measurements decide the branch; this case does
+    not prescribe a historical target period, directive sequence, or design.
+  signature:
+    lut_util_pct: {min: 45}
+    hard_macro_present: true
+    wns_ns: {max: -5.0}
+    avg_route_pct: {min: 70}
+    max_logic_levels: {min: 12}
+    eligible_hf_count: {min: 2}
+    max_actionable_fanout: {min: 60}
+  confidence: 0.76
+  bottleneck: mixed
+  suggested_skill_order:
+    [implementation_recipe, fresh_place_route, operator_mining, force_replicate, pblock_sweep]
+  notes: >
+    This is mechanism-level guidance only. Do not infer a target period or
+    physical selector from it; compare the available typed actions using the
+    anonymous current-seed reports and retain regressions as evidence.
+
+- id: HIGH_UTIL_TARGET_PERIOD_REPLACE_ROUTE
+  description: >
+    High-utilization deep route/fanout profile with hard macros and severely
+    negative slack in a high-utilization SoC. One compressed target-period re-place +
+    re-route attempt (5 ns constraint, critical-net force replication,
+    AlternateCLBRouting) beats incremental ECO grinding. Budget most of the
+    hour for it.
+  signature:
+    lut_util_pct: {min: 45}
+    hard_macro_present: true
+    wns_ns: {max: -5.0}
+    avg_route_pct: {min: 70}
+    max_logic_levels: {min: 12}
+    eligible_hf_count: {min: 2}
+    max_actionable_fanout: {min: 60}
+  confidence: 0.88
+  bottleneck: fanout
+  suggested_skill_order: [implementation_recipe, force_replicate, phys_opt, critical_net_reroute, fanout_opt]
+  core_skills: [implementation_recipe, force_replicate]
+  budget_hint_s: 3600
+  initial_params:
+    implementation_recipe:
+      target_candidates:
+        - derived_pressure_replace_route_v1
+        - full_reimplementation_retime_v1
+        - routed_critical_cleanup_v1
+      replace_target_candidates: true
+    force_replicate:
+      target_candidates: [auto_highfanout_group]
+      replace_target_candidates: true
+      num_paths: 40
+      max_nets: 8
+      endpoint_min_fanout: 4
+      fallback_min_fanout: 60
+      passes: 1
+      unroute_scope: global
+      pre_place_post_place_opt: true
+      route_directive: NoTimingRelaxation
+      route_tns_cleanup: true
+      post_rep_phys_opt: AggressiveFanoutOpt
+      final_phys_opt: Explore
+      final_route: false
+      min_remaining_s: 1800
+    phys_opt:
+      target_candidates: [AggressiveFanoutOpt, AggressiveExplore, Default]
+      replace_target_candidates: true
+  evidence:
+    - benchmark: boom_soc
+      baseline_mhz: 48.24
+      achieved_mhz: 96.909
+      note: >
+        Manual target-period evidence: 5 ns constraint + replace/route flow
+        reached ~96.9 MHz (learned ceiling estimate). Public baseline agent
+        only reached 50.77 in 1h.
+    - benchmark: boom_soc
+      baseline_mhz: 48.237
+      achieved_mhz: 91.89
+      note: >
+        v3 autonomous run (2026-07-20, $0.06, 3799s), independently reopened:
+        the single 5.0 ns target-period fast-route-floor recipe produced live
+        WNS -5.882 ns, equivalent to -9.313 ns in the original 1.569 ns
+        frame. The resulting 91.89 MHz is route/hold/pulse-width clean.
+
+- id: CLOCK_TIGHTEN_SWEEP
+  description: >
+    The constraint is loose relative to what the routed implementation
+    already achieves (positive or barely-negative slack, high baseline Fmax,
+    shallow logic). Re-constrain the clock tighter and re-run a bounded
+    place/route sweep; the implementation follows the constraint.
+  signature:
+    closure_ratio: {min: -0.25}
+    baseline_fmax_mhz: {min: 250}
+    max_logic_levels: {max: 6}
+    max_actionable_fanout: {max: 500}
+    avg_route_pct: {max: 55}
+  confidence: 0.88
+  bottleneck: clock_constraint
+  suggested_skill_order: [clock_tighten, fresh_place_route, phys_opt, post_route_cleanup, critical_net_reroute, pblock_sweep]
+  core_skills: [clock_tighten]
+  budget_hint_s: 1800
+  initial_params:
+    clock_tighten:
+      factors: [0.92, 0.88, 0.84]
+      recipes: [extra_timing_no_relax]
+      max_candidates: 3
+      max_fmax_mhz: 0.0
+      target_candidates: [auto]
+      replace_target_candidates: true
+      recipe_timeout_s: 1800
+  evidence:
+    - benchmark: vexriscv_re-place
+      baseline_mhz: 310.174
+      achieved_mhz: 484.496
+      note: clock retarget + re-place/route family; +174 MHz over original.
+  notes: >
+    After ONE accepted clock_tighten on this profile the run is usually
+    done — further loops rarely pay. Consider save_and_exit.
+
+- id: COMPACT_CLOCK_TIGHTEN_DEEP_SWEEP
+  description: >
+    Tiny, comfortably-met design (positive WNS >= ~0.35, LUT util <= ~8%,
+    shallow logic). The true Fmax is far above the constraint: sweep many
+    tighter periods, tightest first, and stop at the first legal routed
+    checkpoint.
+  signature:
+    wns_ns: {min: 0.35}
+    lut_util_pct: {max: 8}
+    max_logic_levels: {max: 6}
+  confidence: 0.88
+  bottleneck: clock_constraint
+  suggested_skill_order: [clock_tighten, fresh_place_route, phys_opt]
+  core_skills: [clock_tighten]
+  budget_hint_s: 1800
+  initial_params:
+    clock_tighten:
+      factors: [0.92, 0.88, 0.84, 0.80, 0.762, 0.76, 0.72, 0.68, 0.64, 0.60]
+      recipes: [extra_timing_no_relax]
+      max_candidates: 10
+      period_order: tightest_first
+      stop_after_first_legal: true
+      enable_pulse_recap: true
+      enable_clock_as_data_false_path: true
+      recap_margin_ns: 0.001
+      max_recap_candidates: 1
+      recipe_timeout_s: 900
+      max_fmax_mhz: 0.0
+      target_candidates: [auto]
+      replace_target_candidates: true
+
+- id: BROAD_FANOUT_SPLIT
+  description: >
+    Many (>= ~50) broad high-fanout nets: classic fanout bottleneck. Split
+    aggressively via fanout_opt; split factor scales with the largest
+    actionable fanout (~3 for 100+, 4 for 500+, 5 for 1500+).
+  signature:
+    broad_hf_count: {min: 50}
+  confidence: 0.82
+  bottleneck: fanout
+  suggested_skill_order: [fanout_opt, force_replicate, fresh_place_route, phys_opt, post_route_cleanup, pblock_sweep]
+  core_skills: [fanout_opt]
+  budget_hint_s: 3600
+  initial_params:
+    fanout_opt: {split_factor: 4}
+
+- id: TARGETED_REPLICATION_FEW_NETS
+  description: >
+    A handful (2-10) of actionable critical high-fanout nets: replicate the
+    drivers surgically (force_replicate with global unroute + NoTimingRelaxation
+    reroute) instead of blanket splitting.
+  signature:
+    broad_hf_count: {min: 2, max: 10}
+  confidence: 0.83
+  bottleneck: fanout
+  suggested_skill_order: [force_replicate, fanout_opt, fresh_place_route, phys_opt, post_route_cleanup, pblock_sweep]
+  core_skills: [force_replicate]
+  budget_hint_s: 2400
+  initial_params:
+    force_replicate:
+      passes: 2
+      unroute_scope: global
+      pre_place_post_place_opt: true
+      route_directive: NoTimingRelaxation
+      route_tns_cleanup: true
+      post_rep_phys_opt: AggressiveFanoutOpt
+      final_phys_opt: Explore
+      final_route: false
+  evidence:
+    - benchmark: amd_mini-isp
+      baseline_mhz: 307.125
+      achieved_mhz: 407.664
+      note: critical fanout replication (num_paths 12) was the effective move.
+    - benchmark: amd_mini-isp
+      baseline_mhz: 307.125
+      achieved_mhz: 406.34
+      note: >
+        v3 agent full autonomous run (2026-07-20, $0.28, 2472s): fresh
+        place/route + targeted replication of skid_tvalid control fanout
+        chain reached 406.3 (+99.2, public baseline agent only +68).
+    - benchmark: vtr_mcml
+      baseline_mhz: 62.247
+      achieved_mhz: 78.995
+      note: high-fanout replication + re-place/route; WNS remains deeply negative afterwards (structural limit).
+    - benchmark: vtr_mcml
+      baseline_mhz: 62.247
+      achieved_mhz: 70.62
+      note: >
+        v3 autonomous run (2026-07-20, $0.17, 3540s), independently reopened:
+        AggressiveFanoutOpt probe (63.41) -> grouped replication (69.16) ->
+        second refreshed replication (69.82) -> AggressiveExplore (70.62).
+        Per-net fanout and critical reroute regressed; grouped replication is
+        the productive first structural move on this deeply failing profile.
+
+- id: GROUPED_FANOUT_REPLICATION_LARGE
+  description: >
+    Very large fabric-only design (~200k+ LUTs) with fanout/route-dominated
+    critical paths: grouped replication (auto high-fanout group harvesting)
+    before any full directive clock sweep.
+  signature:
+    hard_macro_present: false
+    lut_count: {min: 200000}
+    lut_util_pct: {max: 65}
+    closure_ratio: {max: 0.0}
+    max_actionable_fanout: {min: 400}
+    bottleneck_any: [fanout, routing]
+  confidence: 0.82
+  bottleneck: fanout
+  suggested_skill_order: [force_replicate, phys_opt, post_route_cleanup, critical_net_reroute, pblock, fresh_place_route, pblock_sweep]
+  core_skills: [force_replicate]
+  budget_hint_s: 3600
+  initial_params:
+    force_replicate:
+      target_candidates: [auto_highfanout_group]
+      num_paths: 24
+      max_nets: 18
+      endpoint_min_fanout: 4
+      fallback_min_fanout: 64
+      passes: 2
+      unroute_scope: global
+      pre_place_post_place_opt: true
+      route_directive: NoTimingRelaxation
+      route_tns_cleanup: true
+      post_rep_phys_opt: AggressiveFanoutOpt
+      final_phys_opt: Explore
+      final_route: false
+
+- id: GROUPED_FANOUT_REPLICATION_MEDIUM
+  description: >
+    Fanout/route-dominated profile with several medium critical fanouts
+    (>= 2 nets at fanout >= ~64): grouped replication of the harvested
+    critical set.
+  signature:
+    eligible_hf_count: {min: 2}
+    max_actionable_fanout: {min: 64}
+    avg_route_pct: {min: 70}
+  confidence: 0.81
+  bottleneck: fanout
+  suggested_skill_order: [force_replicate, phys_opt, post_route_cleanup, critical_net_reroute, pblock, fresh_place_route, pblock_sweep]
+  core_skills: [force_replicate]
+  budget_hint_s: 2400
+  initial_params:
+    force_replicate:
+      target_candidates: [auto_highfanout_group]
+      num_paths: 24
+      max_nets: 18
+      endpoint_min_fanout: 4
+      fallback_min_fanout: 64
+      passes: 2
+      unroute_scope: global
+      pre_place_post_place_opt: true
+      route_directive: NoTimingRelaxation
+      route_tns_cleanup: true
+      post_rep_phys_opt: AggressiveFanoutOpt
+      final_phys_opt: Explore
+      final_route: false
+  evidence:
+    - benchmark: finn_radioml
+      baseline_mhz: 284.900
+      achieved_mhz: 345.066
+      note: >
+        Replication chain found the true best (+20.6 over public baseline).
+        Caution: naive fanout_opt candidates hit fanout=1 nets or regressed
+        badly — filter candidates by actionable fanout.
+    - benchmark: finn_radioml
+      baseline_mhz: 284.900
+      achieved_mhz: 315.36
+      note: >
+        v3 autonomous run (2026-07-20, $0.17, 3430s), independently reopened:
+        grouped replication delivered nearly all gain (312.89), followed by
+        Explore (314.47) and one targeted replication (315.36). Cleanup,
+        additional targeted replication, reroute, and endpoint moves did not
+        improve; prioritize the grouped replication early.
+    - benchmark: rosetta_3d-rendering
+      baseline_mhz: 270.929
+      achieved_mhz: 287.687
+      note: high-fanout replication + place/route gave a small real gain.
+    - benchmark: rosetta_3d-rendering
+      baseline_mhz: 270.929
+      achieved_mhz: 299.85
+      note: >
+        v3 autonomous run (2026-07-20, $0.17, 2676s), independently reopened:
+        fresh ExtraNetDelay/NoTimingRelaxation reached 291.38, grouped
+        replication reached 298.60, and Explore polished to 299.85. A second
+        grouped replication and per-net fanout split regressed.
+
+- id: VERY_HIGH_UTIL_BACKEND_RETIME_CLEANUP
+  description: >
+    Extreme LUT utilization (>= ~85%) with deep logic (30+ levels) leaves no
+    LUT headroom for LUT restructure, but grouped replication of the current
+    critical fanout set can still be highly productive. Replicate and reroute
+    first, then use bounded backend cleanup or phys_opt (a high-utilization
+    style).
+  signature:
+    lut_util_pct: {min: 85}
+    hard_macro_present: true
+    wns_ns: {max: -5.0}
+    max_logic_levels: {min: 30}
+    avg_route_pct: {min: 45}
+    route_dominated_ratio: {min: 0.50}
+    max_actionable_fanout: {min: 64}
+    broad_hf_count: {max: 50}
+  confidence: 0.87
+  bottleneck: mixed
+  suggested_skill_order: [force_replicate, phys_opt, post_route_cleanup, critical_net_reroute, fresh_place_route, pblock, pblock_sweep]
+  core_skills: [force_replicate, phys_opt]
+  budget_hint_s: 2400
+  initial_params:
+    phys_opt:
+      target_candidates: [AggressiveExplore, Explore, Default, AddRetime]
+      replace_target_candidates: true
+    post_route_cleanup:
+      recipes: [phys_aggr_explore, route_higher_tns_phys_explore, route_aggr_phys_explore]
+      max_candidates: 3
+      max_iterations: 1
+      recipe_timeout_s: 1200
+    force_replicate:
+      target_candidates: [auto_highfanout_group]
+      num_paths: 24
+      max_nets: 18
+      endpoint_min_fanout: 4
+      fallback_min_fanout: 64
+      passes: 2
+      unroute_scope: global
+      pre_place_post_place_opt: true
+      route_directive: NoTimingRelaxation
+      route_tns_cleanup: true
+      post_rep_phys_opt: AggressiveFanoutOpt
+      final_phys_opt: Explore
+      final_route: false
+  evidence:
+    - benchmark: ispd16_example2
+      baseline_mhz: 107.643
+      achieved_mhz: 160.69
+      note: >
+        v3 autonomous run (2026-07-20, $0.07), independently reopened:
+        two-pass grouped replication improved WNS by 3.055 ns and delivered
+        almost all gain; AggressiveFanoutOpt added only 0.023 ns. Cleanup and
+        critical-net reroute regressed. The 4641s wall time included CPU/memory
+        contention from now-fixed orphan Vivado processes.
+  notes: >
+    Historical baseline runs timed out at 0.0%, but the v3 grouped-replication
+    result establishes a strong first move. Treat full re-place as high-risk;
+    spend the first large budget block on one grouped replication, then only
+    bounded polish with checkpoints.
+
+- id: SHALLOW_HARD_MACRO_ROUTE_SWEEP
+  description: >
+    Low-utilization design with hard macros, shallow logic (<= ~4 levels)
+    but heavily route-dominated and spread placement: a full re-place +
+    re-route with ExtraNetDelay/NoTimingRelaxation beats grouped
+    replication as the FIRST move.
+  signature:
+    lut_util_pct: {max: 30}
+    hard_macro_present: true
+    wns_ns: {max: -0.5}
+    avg_route_pct: {min: 80}
+    route_dominated_ratio: {min: 0.80}
+    max_logic_levels: {max: 4}
+    broad_hf_count: {max: 1}
+    max_actionable_fanout: {max: 1500}
+    spread_ratio: {min: 0.20}
+  confidence: 0.84
+  bottleneck: routing
+  suggested_skill_order: [fresh_place_route, post_route_cleanup, critical_net_reroute, phys_opt, force_replicate, pblock, pblock_sweep]
+  core_skills: [fresh_place_route]
+  budget_hint_s: 2400
+  initial_params:
+    fresh_place_route:
+      recipes: [extranetdelay_no_relax]
+      max_candidates: 1
+      recipe_timeout_s: 2400
+      min_remaining_s: 1800
+
+- id: MEMORY_ADDRESS_GUIDANCE_PBLOCK
+  description: >
+    Memory-address fanout profile (address plumbing dominates critical
+    fanouts, deep logic, high route share): guidance pblock seed first, then
+    endpoint-aware fresh place/route.
+  signature:
+    memory_address_profile: true
+    max_logic_levels: {min: 7}
+    avg_route_pct: {min: 45}
+    broad_hf_count: {max: 1}
+  confidence: 0.82
+  bottleneck: mixed
+  suggested_skill_order: [pblock, fresh_place_route, endpoint_bel_move, phys_opt, post_route_cleanup, critical_net_reroute, force_replicate, pblock_sweep]
+  core_skills: [pblock, fresh_place_route]
+  budget_hint_s: 2400
+  initial_params:
+    pblock:
+      release_after_place: true
+      post_route_phys_opt: AggressiveFanoutOpt
+      target_ff_multiplier: 0.0
+      guidance_only: true
+      validate_resources: false
+      max_expansion_attempts: 0
+    fresh_place_route:
+      recipes: [extranetdelay_no_relax]
+      max_candidates: 1
+    endpoint_bel_move: {num_paths: 20, max_candidates: 6}
+
+- id: LOW_UTIL_HARD_PBLOCK
+  description: >
+    Low/unknown utilization, clearly failing (WNS worse than about -1 ns),
+    route- or placement-bound, no strong fanout story: compact the design
+    with a hard pblock floorplan.
+  signature:
+    lut_util_pct: {max: 30}
+    wns_ns: {max: -1.0}
+    avg_route_pct: {min: 50}
+  confidence: 0.78
+  bottleneck: placement
+  suggested_skill_order: [pblock, phys_opt, post_route_cleanup, fresh_place_route, force_replicate, pblock_sweep]
+  core_skills: [pblock]
+  budget_hint_s: 3600
+  initial_params:
+    pblock:
+      release_after_place: false
+      place_directive: Default
+      pre_route_phys_opt: Explore
+      route_directive: Explore
+      post_route_phys_opt: AggressiveExplore
+      target_ff_multiplier: 0.0
+      guidance_only: true
+      validate_resources: false
+      max_expansion_attempts: 0
+  evidence:
+    - benchmark: corescore_500_mod
+      baseline_mhz: 344.234
+      achieved_mhz: 363.64
+      note: >
+        v3 autonomous run (2026-07-20, $0.11, 3068s), independently reopened:
+        guidance pblock improved WNS by 0.155 ns and was the only accepted
+        move. Fresh route, grouped replication, and two per-net fanout splits
+        all regressed.
+
+- id: CLUSTER_ANCHOR_PLACEMENT_SPREAD
+  description: >
+    Placement-dominant bottleneck with critical cells spread across the die
+    and no broad fanout recipe: first try a timing-directed fresh place/route;
+    if that seed is weak, anchor the critical cluster into a tight bbox and
+    re-place/route locally.
+  signature:
+    dominant_bottleneck: placement
+    spread_ratio: {min: 0.15}
+  confidence: 0.78
+  bottleneck: placement
+  suggested_skill_order: [fresh_place_route, critical_cluster_anchor, pblock_sweep, pblock, phys_opt, post_route_cleanup]
+  core_skills: [fresh_place_route, critical_cluster_anchor]
+  budget_hint_s: 2400
+  initial_params:
+    fresh_place_route:
+      recipes: [extranetdelay_no_relax, extratiming_no_relax]
+      max_candidates: 2
+    critical_cluster_anchor:
+      num_paths: 12
+      max_cells: 24
+      max_nets: 12
+      bbox_pad_x: 4
+      bbox_pad_y: 8
+  evidence:
+    - benchmark: rosetta_optical-flow
+      baseline_mhz: 324.886
+      achieved_mhz: 336.474
+      note: cluster-anchor bbox beat retime-only (325.3) on this profile.
+    - benchmark: rosetta_optical-flow
+      baseline_mhz: 324.886
+      achieved_mhz: 353.98
+      note: >
+        v3 autonomous run (2026-07-20, $0.17, 3132s), independently reopened:
+        plain Explore gained only 0.004 ns, while fresh
+        ExtraNetDelay/NoTimingRelaxation gained 0.248 ns to 353.86 MHz.
+        Local LUT reflow, LUT merge, reroute, and later phys_opt regressed;
+        one endpoint BEL move added only 0.001 ns.
+
+- id: SMALL_CORE_FRESH_THEN_REPLICATE
+  description: >
+    Small CPU-core-class design (a few thousand LUTs, a handful of hard
+    macros, high baseline Fmax, short clock period): a fresh re-place +
+    re-route with ExtraNetDelay/NoTimingRelaxation directives moves the
+    needle first; THEN harvest the NEW critical high-fanout nets from the
+    refreshed timing and force-replicate them. Micro-polish (reroutes,
+    cleanup, phys_opt) on the ORIGINAL placement is a dead end on this
+    profile — evidence showed +0.2 MHz from polish vs +27 MHz from the
+    fresh+replicate chain.
+  signature:
+    lut_count: {max: 20000}
+    hard_macro_present: true
+    baseline_fmax_mhz: {min: 280}
+    max_logic_levels: {max: 9}
+    broad_hf_count: {max: 2}
+  confidence: 0.86
+  bottleneck: routing
+  suggested_skill_order: [fresh_place_route, force_replicate, phys_opt, post_route_cleanup, endpoint_bel_move, clock_tighten]
+  core_skills: [fresh_place_route, force_replicate]
+  budget_hint_s: 3600
+  initial_params:
+    fresh_place_route:
+      recipes: [extranetdelay_no_relax, extratiming_no_relax]
+      max_candidates: 2
+    force_replicate:
+      target_candidates: [auto_highfanout_group]
+      replace_target_candidates: true
+      num_paths: 24
+      max_nets: 12
+      endpoint_min_fanout: 4
+      fallback_min_fanout: 32
+      passes: 1
+      unroute_scope: global
+      pre_place_post_place_opt: true
+      route_directive: NoTimingRelaxation
+      route_tns_cleanup: true
+      post_rep_phys_opt: AggressiveFanoutOpt
+      final_phys_opt: Explore
+      final_route: false
+  evidence:
+    - benchmark: vexriscv_re-place_v2
+      baseline_mhz: 397.456
+      achieved_mhz: 430.293
+      note: >
+        Automatic chain fresh_place_route -> force_replicate (harvested from
+        the refreshed timing) reached 424.4; accepted best 430.293 via
+        micro-ECO on top. Polish-only runs on the original placement
+        plateaued at +0.2 MHz. Identity check: true-v2 has routable_nets
+        3501/3592/3593 (the 3248-family is the older vexriscv_re-place).
+    - benchmark: vexriscv_re-place_v2
+      baseline_mhz: 397.456
+      achieved_mhz: 421.59
+      note: >
+        v3 agent full autonomous run (2026-07-20, $0.22, 3150s): fresh
+        extranetdelay (399.7) -> grouped force_replicate (420.7) confirmed
+        as the two big steps; later pblock/replicate variants regressed and
+        rolled back. Remaining gap to 430.3 sits in micro-ECO endgame.
+    - benchmark: vexriscv_re-place
+      baseline_mhz: 310.174
+      achieved_mhz: 484.496
+      note: same family; clock retarget + re-place/route reached +174 MHz.
+    - benchmark: vexriscv_re-place
+      baseline_mhz: 310.174
+      achieved_mhz: 481.23
+      note: >
+        v3 autonomous run (2026-07-20, $0.15, 2061s), independently reopened:
+        fresh ExtraNetDelay/NoTimingRelaxation reached 450.9, one targeted
+        RS2 replication reached 456.2, and a second fresh ExtraTiming route
+        reached 481.23. Other replication/fanout attempts regressed. This run
+        reached the known 484.50 neighborhood without changing the clock.
+  notes: >
+    Order matters: replicate AFTER the fresh route, using targets harvested
+    from the new timing (pre-fresh fanout lists are stale). On tight time
+    budgets prefer one fresh_place_route candidate then one replicate pass.
+
+- id: MODERATE_WNS_DIRECTIVE_SWEEP
+  description: >
+    Moderately failing (roughly -2 ns .. -0.5 ns), shallow logic, no
+    structural bottleneck, not route-dominated: sweep place/route directive
+    recipes (ExtraNetDelay / ExtraTiming with NoTimingRelaxation).
+  signature:
+    wns_ns: {min: -2.0, max: -0.5}
+    max_logic_levels: {max: 4}
+    max_actionable_fanout: {max: 500}
+    avg_route_pct: {max: 65}
+  confidence: 0.76
+  bottleneck: mixed
+  suggested_skill_order: [fresh_place_route, phys_opt, post_route_cleanup, critical_net_reroute, pblock_sweep]
+  core_skills: [fresh_place_route]
+  budget_hint_s: 2400
+  initial_params:
+    fresh_place_route:
+      recipes: [extranetdelay_no_relax, extratiming_no_relax]
+      max_candidates: 2

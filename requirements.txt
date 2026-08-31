@@ -1,8 +1,19 @@
-# FDAgents ablation workspace dependencies
-mcp>=1.0.0
+# Compatibility dependency list for standalone MCP setup scripts.
+# The root `make setup` uses the exact environment locked in uv.lock.
+
+# Core dependencies
+mcp==1.28.1
+
+# OpenAI client (only needed for full agent mode using OpenRouter, not test mode)
 openai>=1.0.0
+z3-solver>=4.12.0
 python-dotenv>=1.0.0
-pexpect>=4.8.0
-PyYAML>=6.0
-# RapidWright python package (JPype bridge); RAPIDWRIGHT_PATH points to a built checkout
+
+# RapidWright MCP dependencies
 rapidwright>=2025.2.1
+
+# Vivado MCP dependencies (pexpect for process control)
+pexpect>=4.8.0
+
+# FDAgents configuration / knowledge base
+pyyaml>=6.0

@@ -13,13 +13,65 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Any
 
 from mcp.server import Server
 from mcp.types import Tool, TextContent, GetPromptResult, PromptMessage
 import mcp.server.stdio
 
-import rapidwright_tools as rw
+
+def _configure_checkout_import_path() -> str | None:
+    """Make the checkout containing this server importable from any run cwd.
+
+    FDAgents deliberately starts MCP servers in an artifact directory.  Python
+    otherwise adds only ``RapidWrightMCP/`` (the script directory) to
+    ``sys.path``, which made the lazy product-sum recovery import fail in both
+    local and remote scratch-deployment layouts. Resolve the checkout from this
+    file; never infer it from cwd or a VM-specific absolute path.
+    """
+    project_root = Path(__file__).resolve().parent.parent
+    if not (project_root / "FDAgents").is_dir():
+        return None
+    root = str(project_root)
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    return root
+
+
+_PROJECT_IMPORT_ROOT = _configure_checkout_import_path()
+
+
+def _tool_param(key: str, default):
+    """Read a `rapidwright_mcp:` tunable from the shared FDAgents config.yaml.
+
+    Standalone config reader: honors FDAGENTS_CONFIG, falls back to the
+    packaged default file, then to the hard-coded default.
+    """
+    try:
+        import yaml  # type: ignore
+        from pathlib import Path
+
+        path_str = os.environ.get("FDAGENTS_CONFIG", "")
+        path = (
+            Path(path_str).expanduser()
+            if path_str
+            else Path(__file__).resolve().parent.parent / "FDAgents" / "config.yaml"
+        )
+        if path.exists():
+            with path.open() as f:
+                data = yaml.safe_load(f) or {}
+            section = data.get("rapidwright_mcp") or {}
+            value = section.get(key, default)
+            return default if value is None else value
+    except Exception:  # noqa: BLE001 — tool layer must work standalone
+        pass
+    return default
+
+try:
+    from . import rapidwright_tools as rw
+except ImportError:
+    import rapidwright_tools as rw
 
 # Global variable for the Java/stdout log file
 _java_log_file = None
@@ -102,6 +154,71 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["dcp_path"]
             }
+        ),
+        Tool(
+            name="insert_registered_product_modules",
+            description=(
+                "Internal registered-arithmetic backend: insert synthesized "
+                "modules from a hash-bound current-DCP bundle."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "bundle_path": {"type": "string", "minLength": 1},
+                    "module_dcps": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string", "minLength": 1},
+                    },
+                    "output_dcp": {"type": "string", "minLength": 1},
+                },
+                "required": ["bundle_path", "module_dcps", "output_dcp"],
+            },
+        ),
+        Tool(
+            name="digest_successor_contract_region",
+            description=(
+                "Read-only route-invariant digest of successor-certificate "
+                "boundary nets and emitted hierarchy inventory."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "boundary_net_names": {
+                        "type": "array", "minItems": 1, "maxItems": 4096,
+                        "uniqueItems": True,
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                    "emitted_instance_names": {
+                        "type": "array", "maxItems": 256,
+                        "uniqueItems": True,
+                        "items": {"type": "string", "minLength": 1},
+                        "default": [],
+                    },
+                },
+                "required": ["boundary_net_names"],
+            },
+        ),
+        Tool(
+            name="prove_control_pin_equivalence_groups",
+            description=(
+                "Internal registered-arithmetic proof: group physical control-pin "
+                "nets only when their upstream transition relations are equivalent."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "pin_names": {
+                        "type": "array", "minItems": 1, "maxItems": 256,
+                        "uniqueItems": True,
+                        "items": {"type": "string", "minLength": 1},
+                    },
+                    "role": {"type": "string", "default": "CE"},
+                },
+                "required": ["pin_names"],
+            },
         ),
         Tool(
             name="report_approx_timing",
@@ -285,6 +402,546 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="analyze_route_connections",
+            description=(
+                "Read-only sink-specific route analysis. Accepts only inline critical-path "
+                "pins or explicit physical-net/sink pairs; reports exact PIP/tree metrics "
+                "and issues mutation certificates only when branch preservation is proven."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "critical_paths_data": {
+                        "type": "array", "maxItems": 64,
+                        "items": {
+                            "type": "array", "maxItems": 256,
+                            "items": {"type": "string", "minLength": 1, "maxLength": 1024},
+                        },
+                    },
+                    "connections": {
+                        "type": "array", "maxItems": 32,
+                        "items": {
+                            "type": "object", "additionalProperties": False,
+                            "properties": {
+                                "physical_net": {"type": "string", "minLength": 1, "maxLength": 1024},
+                                "sink_pin": {"type": "string", "minLength": 1, "maxLength": 1024},
+                            },
+                            "required": ["physical_net", "sink_pin"],
+                        },
+                    },
+                    "max_connections": {"type": "integer", "minimum": 1, "maximum": 32, "default": 16},
+                },
+                "anyOf": [
+                    {"required": ["critical_paths_data"]},
+                    {"required": ["connections"]},
+                ],
+            },
+        ),
+        Tool(
+            name="operator_mining",
+            description=(
+                "Read-only structural hypothesis mining on the loaded exact DCP. "
+                "Reports repeated critical-path primitive motifs, wide register "
+                "transport families, DSP headroom, hard-macro columns, and clock "
+                "footprint. Results are hypothesis_only and never authorize mutation."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "critical_paths_data": {
+                        "type": "array", "minItems": 1, "maxItems": 64,
+                        "items": {
+                            "type": "array", "maxItems": 256,
+                            "items": {
+                                "type": "string", "minLength": 1, "maxLength": 1024
+                            },
+                        },
+                        "description": (
+                            "Optional inline cell or cell/pin sequences from Vivado "
+                            "extract_critical_path_cells/pins; no file path is accepted."
+                        ),
+                    },
+                    "min_family_size": {
+                        "type": "integer", "minimum": 2, "maximum": 64, "default": 3
+                    },
+                    "max_families": {
+                        "type": "integer", "minimum": 1, "maximum": 32, "default": 16
+                    },
+                    "max_motif_cells": {
+                        "type": "integer", "minimum": 3, "maximum": 12, "default": 8
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="recover_recurrence_contract",
+            description=(
+                "Read-only exact recovery for one recurrence hypothesis. Freshly "
+                "rediscovers the candidate, derives state width from DSP C/P bit "
+                "connectivity, verifies FF controls and side fanout, and emits a "
+                "hash-bound extracted_unproved region contract."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "critical_paths_data": {
+                        "type": "array", "minItems": 1, "maxItems": 64,
+                        "items": {
+                            "type": "array", "minItems": 1, "maxItems": 256,
+                            "items": {
+                                "type": "string", "minLength": 1, "maxLength": 1024
+                            },
+                        },
+                    },
+                    "candidate_id": {
+                        "type": "string", "pattern": "^recurrence:[0-9a-f]{20}$"
+                    },
+                },
+                "required": ["critical_paths_data", "candidate_id"],
+            },
+        ),
+        Tool(
+            name="recover_sequential_operator_contract",
+            description=(
+                "Read-only fresh recovery of one current-DCP sequential write "
+                "family. Reports exact bit mapping, controls, data drivers and "
+                "explicit proof gaps; it never authorizes mutation."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "critical_paths_data": {
+                        "type": "array", "minItems": 1, "maxItems": 64,
+                        "items": {
+                            "type": "array", "minItems": 1, "maxItems": 256,
+                            "items": {
+                                "type": "string", "minLength": 1, "maxLength": 1024
+                            },
+                        },
+                    },
+                    "candidate_id": {
+                        "type": "string", "pattern": "^sequential:[0-9a-f]{20}$"
+                    },
+                },
+                "required": ["critical_paths_data", "candidate_id"],
+            },
+        ),
+        Tool(
+            name="recover_consumer_driven_operator_contract",
+            description=(
+                "Read-only consumer-driven semantic recovery for one current "
+                "sequential family. Exact object identities remain private."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "critical_paths_data": {
+                        "type": "array", "minItems": 1, "maxItems": 64,
+                        "items": {
+                            "type": "array", "minItems": 1, "maxItems": 64,
+                            "items": {
+                                "type": "string", "minLength": 1, "maxLength": 1024
+                            },
+                        },
+                    },
+                    "candidate_id": {
+                        "type": "string", "pattern": "^sequential:[0-9a-f]{20}$"
+                    },
+                },
+                "required": ["critical_paths_data", "candidate_id"],
+            },
+        ),
+        Tool(
+            name="recover_registered_dead_state_contract",
+            description=(
+                "Read-only full-design output-observable closure with exact "
+                "mutation identities retained in a private manifest."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "source_dcp_sha256": {
+                        "type": "string", "pattern": "^[0-9a-f]{64}$"
+                    },
+                    "manifest_path": {"type": "string", "minLength": 1},
+                },
+                "required": ["source_dcp_sha256", "manifest_path"],
+            },
+        ),
+        Tool(
+            name="recover_recurrence_family_contract",
+            description=(
+                "Read-only exact full-design recurrence-family recovery. Scans the "
+                "currently loaded DCP without timing names, proves compatible periodic "
+                "boundaries and disjoint rewrite windows, and returns one hash-bound "
+                "family contract with mutation_eligible=false."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "max_boundaries": {
+                        "type": "integer", "minimum": 2, "maximum": 64, "default": 32
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="propose_recurrence_family_placement_candidates",
+            description=(
+                "Read-only bounded global placement proposals for every freshly "
+                "recovered recurrence-family boundary. Cascade regions remain locality "
+                "metadata; Vivado proves connected placement and exact clock-leaf reuse."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "max_srl_sites": {
+                        "type": "integer", "minimum": 1, "maximum": 1024, "default": 32
+                    },
+                    "max_ce_clone_sites": {
+                        "type": "integer", "minimum": 1, "maximum": 128, "default": 16
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="propose_recurrence_placement_candidates",
+            description=(
+                "Read-only exact-seed recurrence placement proposal. Freshly "
+                "rediscovers and recovers the candidate before ranking bounded global "
+                "SLICE slots; Vivado remains placement and clock-leaf authority."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "critical_paths_data": {
+                        "type": "array", "minItems": 1, "maxItems": 16,
+                        "items": {
+                            "type": "array", "minItems": 1, "maxItems": 256,
+                            "items": {
+                                "type": "string", "minLength": 1, "maxLength": 1024
+                            },
+                        },
+                    },
+                    "candidate_id": {
+                        "type": "string", "pattern": "^recurrence:[0-9a-f]{20}$"
+                    },
+                    "max_srl_sites": {
+                        "type": "integer", "minimum": 1, "maximum": 1024, "default": 32
+                    },
+                    "max_ce_clone_sites": {
+                        "type": "integer", "minimum": 1, "maximum": 128, "default": 16
+                    },
+                },
+                "required": ["critical_paths_data", "candidate_id"],
+            },
+        ),
+        Tool(
+            name="recover_fixed_point_contract",
+            description=(
+                "Read-only autonomous fabric fixed-point recovery. Freshly "
+                "rediscovers FF-bounded LUT/CARRY cones on the loaded exact DCP, "
+                "recovers each constant coefficient symbolically with an exact "
+                "bit-vector unsat check, and emits hash-bound "
+                "fixed_point_facts_extracted_unproved contracts with "
+                "mutation_eligible=false."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "max_candidates": {
+                        "type": "integer", "minimum": 1, "maximum": 64, "default": 8
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="recover_registered_product_sum_contract",
+            description=(
+                "Read-only exact recovery of registered product sums, including "
+                "independently shifted and partitioned full-precision orders, "
+                "from the loaded exact DCP. Returns hash-bound contracts with "
+                "mutation_eligible=false and typed rejections."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "max_candidates": {
+                        "type": "integer", "minimum": 1, "maximum": 64,
+                        "default": 16,
+                    },
+                    "preferred_output_cells": {
+                        "type": "array", "maxItems": 16,
+                        "items": {"type": "string", "minLength": 1,
+                                  "maxLength": 1024},
+                        "default": [],
+                    },
+                    "timeout_ms": {
+                        "type": "integer", "minimum": 1, "maximum": 600000,
+                        "default": 30000,
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="propose_fixed_point_placement_candidates",
+            description=(
+                "Read-only exact-seed fixed-point placement proposal. Freshly "
+                "re-recovers the hash-bound cone before ranking idle DSP48E2 "
+                "sites by Manhattan distance from the cone centroid; Vivado "
+                "remains placement and clock authority."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "region_sha256": {
+                        "type": "string", "pattern": "^[0-9a-f]{64}$"
+                    },
+                    "max_sites": {
+                        "type": "integer", "minimum": 1, "maximum": 256, "default": 64
+                    },
+                },
+                "required": ["region_sha256"],
+            },
+        ),
+        Tool(
+            name="recover_two_operand_contract",
+            description=(
+                "Read-only autonomous fabric two-operand multiply recovery. "
+                "Freshly rediscovers FF-bounded LUT/CARRY cones fed by exactly "
+                "two registered data buses on the loaded exact DCP, recovers "
+                "shift and signedness from concrete probes with an exact "
+                "bit-vector unsat check, and emits hash-bound "
+                "two_operand_facts_extracted_unproved contracts with "
+                "mutation_eligible=false."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "max_candidates": {
+                        "type": "integer", "minimum": 1, "maximum": 64, "default": 8
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="propose_two_operand_placement_candidates",
+            description=(
+                "Read-only exact-seed two-operand placement proposal. Freshly "
+                "re-recovers the hash-bound cone before ranking idle DSP48E2 "
+                "sites by Manhattan distance from the cone centroid; Vivado "
+                "remains placement and clock authority."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "region_sha256": {
+                        "type": "string", "pattern": "^[0-9a-f]{64}$"
+                    },
+                    "max_sites": {
+                        "type": "integer", "minimum": 1, "maximum": 256, "default": 64
+                    },
+                },
+                "required": ["region_sha256"],
+            },
+        ),
+        Tool(
+            name="recover_register_absorb_contract",
+            description=(
+                "Read-only autonomous DSP input register absorption recovery. "
+                "Freshly rediscovers fabric FDRE buses that solely drive a "
+                "DSP48E2 A or B input whose AREG/BREG is disabled, checks "
+                "uniform clock/CE/reset and GND-tied hardened controls, and "
+                "emits hash-bound register_absorb_facts_extracted_unproved "
+                "contracts with mutation_eligible=false."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "max_candidates": {
+                        "type": "integer", "minimum": 1, "maximum": 64, "default": 8
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="recover_pipeline_rebalance_contract",
+            description=(
+                "Read-only autonomous DSP48E2 multiplier pipeline-rebalance "
+                "recovery. Freshly rediscovers cells eligible for the "
+                "bidirectional AREG/BREG<->MREG retiming move (static "
+                "MULTIPLY M-path mode, direct operands, no cascade traffic, "
+                "one shared CE and reset net with GND-tied vacated "
+                "controls), and emits hash-bound "
+                "pipeline_rebalance_facts_extracted_unproved contracts with "
+                "mutation_eligible=false."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "max_candidates": {
+                        "type": "integer", "minimum": 1, "maximum": 64, "default": 8
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="recover_memory_primitive_contracts",
+            description=(
+                "Read-only autonomous configured BRAM recovery. Enumerates "
+                "RAMB18E2/RAMB36E2 cells on the loaded exact DCP and derives "
+                "port widths, output registers, write modes, collision "
+                "configuration, initialization identity, and exact pin/net "
+                "boundaries. No semantic width, mode, latency, or cell-name "
+                "parameters are accepted; emitted facts remain unproved and "
+                "mutation_eligible=false."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "max_candidates": {
+                        "type": "integer", "minimum": 1, "maximum": 256,
+                        "default": 64,
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="recover_memory_consumer_dependencies",
+            description=(
+                "Read-only autonomous BRAM consumer recovery. Traces every "
+                "configured memory output through its canonical parent net to "
+                "all leaf sinks and emits hash-bound producer/consumer edges. "
+                "No hierarchy, cell-name, width, mode, or operator parameters "
+                "are accepted; facts remain unproved and mutation_eligible=false."
+            ),
+            inputSchema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "max_candidates": {
+                        "type": "integer", "minimum": 1, "maximum": 256,
+                        "default": 64,
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="find_proven_equivalent_sources",
+            description=(
+                "Read-only, fail-closed exact-source equivalence proof for placed FDRE/FDSE/"
+                "FDCE/FDPE (including _1 forms) and LUT1..LUT6 sources found from inline critical-path pins. "
+                "No similarity, current-value, cell-name, or cone inference is used."
+            ),
+            inputSchema={
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "critical_paths_data": {
+                        "type": "array", "minItems": 1, "maxItems": 16,
+                        "items": {
+                            "type": "array", "minItems": 1, "maxItems": 256,
+                            "items": {"type": "string", "minLength": 1, "maxLength": 1024},
+                        },
+                    },
+                    "max_candidates": {"type": "integer", "minimum": 1, "maximum": 4, "default": 4},
+                    "min_distance": {"type": "integer", "minimum": 1, "maximum": 256, "default": 1},
+                },
+                "required": ["critical_paths_data"],
+            },
+        ),
+        Tool(
+            name="selective_unroute_sink_branches",
+            description=(
+                "Controlled mutation: remove only analysis-certified sink branches. "
+                "Rejects clock/static/fixed/ambiguous or unproven shared-trunk targets, "
+                "is single-use per exact checkpoint load, and never whole-net unroutes."
+            ),
+            inputSchema={
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "connections": {
+                        "type": "array", "minItems": 1, "maxItems": 4,
+                        "items": {
+                            "type": "object", "additionalProperties": False,
+                            "properties": {
+                                "physical_net": {"type": "string", "minLength": 1, "maxLength": 1024},
+                                "sink_pin": {"type": "string", "minLength": 1, "maxLength": 1024},
+                                "before_net_pip_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                                "before_sink_pip_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                                "certificate": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                            },
+                            "required": [
+                                "physical_net", "sink_pin", "before_net_pip_digest",
+                                "before_sink_pip_digest", "certificate",
+                            ],
+                        },
+                    },
+                },
+                "required": ["connections"],
+            },
+        ),
+        Tool(
+            name="rewire_sink_to_proven_source",
+            description=(
+                "Internal skill-only mutation accepting only the complete "
+                "certificate produced by the exact loaded session."
+            ),
+            inputSchema={
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "certificate": {"type": "object"},
+                },
+                "required": ["certificate"],
+            },
+        ),
+        Tool(
+            name="relocate_structure_cluster",
+            description=(
+                "Internal skill-only exact-cluster relocation bound to a "
+                "framework-owned structure digest."
+            ),
+            inputSchema={
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "structure": {"type": "object"},
+                    "expected_digest": {
+                        "type": "string", "pattern": "^[0-9a-f]{64}$",
+                    },
+                    "tile_col_offset": {"type": "integer"},
+                    "tile_row_offset": {"type": "integer"},
+                    "max_boundary_nets": {
+                        "type": "integer", "minimum": 1, "maximum": 256,
+                        "default": 16,
+                    },
+                    "max_boundary_pins": {
+                        "type": "integer", "minimum": 1, "maximum": 2048,
+                        "default": 128,
+                    },
+                },
+                "required": [
+                    "structure", "expected_digest", "tile_col_offset",
+                    "tile_row_offset",
+                ],
+            },
+        ),
+        Tool(
             name="optimize_fanout",
             description="Optimize high fanout nets by splitting them into multiple driven nets. This reduces fanout by replicating the source driver and can improve timing and routability.",
             inputSchema={
@@ -336,7 +993,7 @@ async def list_tools() -> list[Tool]:
             description="""Analyze FPGA fabric to find the best contiguous region for a pblock (area constraint).
             
             Identifies regions that:
-            1. Have enough resources (SLICEs, DSPs, BRAMs) for target utilization
+            1. Have enough resources (SLICEs, DSPs, BRAMs, URAMs) for target utilization
             2. Minimize crossing of delay-heavy columns (URAM, IO, etc.)
             3. Are as contiguous as possible
             
@@ -361,12 +1018,34 @@ async def list_tools() -> list[Tool]:
                         "type": "integer",
                         "description": "Required BRAMs (1.5x current usage, default: 0)"
                     },
+                    "target_uram_count": {
+                        "type": "integer",
+                        "description": "Required URAMs (1.5x current usage, default: 0)"
+                    },
                     "device_name": {
                         "type": "string",
                         "description": "Device name (optional, uses loaded design's device if omitted)"
                     }
                 },
                 "required": ["target_lut_count", "target_ff_count"]
+            }
+        ),
+        Tool(
+            name="analyze_clock_region_pblock_grid",
+            description="""Read the loaded part's clock-region grid through RapidWright Device APIs.
+
+            Returns per-clock-region LUT/FF-derived slice capacity, DSP/BRAM/URAM
+            capacity, placement occupancy, and separate critical/remainder demand.
+            This is read-only and intended for clock-aligned pblock siblings.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "critical_cell_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "maxItems": 256,
+                    }
+                }
             }
         ),
         Tool(
@@ -421,7 +1100,7 @@ async def list_tools() -> list[Tool]:
             - Top-level module name must match
             - I/O port names, directions, and widths must match
             - Device must match
-            - Cell count can increase (optimizations add cells) but not decrease or increase >50%
+            - Cell counts are reported for context but do not affect PASS/FAIL
             
             Returns PASS/FAIL status with detailed comparison report.
             This should be run BEFORE functional simulation to quickly catch structural errors.""",
@@ -630,6 +1309,176 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             result = rw.inspect_lut_pin_swap_candidates(
                 cell_pins=arguments["cell_pins"]
             )
+
+        elif name == "analyze_route_connections":
+            result = rw.analyze_route_connections(
+                connections=arguments.get("connections"),
+                critical_paths_data=arguments.get("critical_paths_data"),
+                max_connections=arguments.get("max_connections", 16),
+            )
+
+        elif name == "operator_mining":
+            result = rw.operator_mining(
+                critical_paths_data=arguments.get("critical_paths_data"),
+                min_family_size=arguments.get("min_family_size", 3),
+                max_families=arguments.get("max_families", 16),
+                max_motif_cells=arguments.get("max_motif_cells", 8),
+            )
+
+        elif name == "recover_recurrence_contract":
+            result = rw.recover_recurrence_contract(
+                critical_paths_data=arguments["critical_paths_data"],
+                candidate_id=arguments["candidate_id"],
+            )
+
+        elif name == "recover_sequential_operator_contract":
+            result = rw.recover_sequential_operator_contract(
+                critical_paths_data=arguments["critical_paths_data"],
+                candidate_id=arguments["candidate_id"],
+            )
+
+        elif name == "recover_consumer_driven_operator_contract":
+            result = rw.recover_consumer_driven_operator_contract(
+                critical_paths_data=arguments["critical_paths_data"],
+                candidate_id=arguments["candidate_id"],
+            )
+
+        elif name == "recover_registered_dead_state_contract":
+            result = rw.recover_registered_dead_state_contract(
+                source_dcp_sha256=arguments["source_dcp_sha256"],
+                manifest_path=arguments["manifest_path"],
+            )
+
+        # Backend-only replica recovery is intentionally absent from list_tools:
+        # Agent packets receive anonymous summaries rather than object names.
+        elif name == "recover_sequential_operator_replicas":
+            result = rw.recover_sequential_operator_replicas(
+                critical_paths_data=arguments["critical_paths_data"],
+                candidate_id=arguments["candidate_id"],
+                max_replicas=arguments.get("max_replicas", 64),
+            )
+
+        elif name == "insert_registered_product_modules":
+            result = rw.insert_registered_product_modules(
+                bundle_path=arguments["bundle_path"],
+                module_dcps=arguments["module_dcps"],
+                output_dcp=arguments["output_dcp"],
+            )
+
+        elif name == "digest_successor_contract_region":
+            result = rw.digest_successor_contract_region(
+                boundary_net_names=arguments["boundary_net_names"],
+                emitted_instance_names=arguments.get("emitted_instance_names", []),
+            )
+
+        elif name == "prove_control_pin_equivalence_groups":
+            result = rw.prove_control_pin_equivalence_groups(
+                pin_names=arguments["pin_names"],
+                role=arguments.get("role", "CE"),
+            )
+
+        elif name == "recover_recurrence_family_contract":
+            result = rw.recover_recurrence_family_contract(
+                max_boundaries=arguments.get("max_boundaries", 32),
+            )
+
+        elif name == "propose_recurrence_family_placement_candidates":
+            result = rw.propose_recurrence_family_placement_candidates(
+                max_srl_sites=arguments.get("max_srl_sites", 32),
+                max_ce_clone_sites=arguments.get("max_ce_clone_sites", 16),
+            )
+
+        elif name == "propose_recurrence_placement_candidates":
+            result = rw.propose_recurrence_placement_candidates(
+                critical_paths_data=arguments["critical_paths_data"],
+                candidate_id=arguments["candidate_id"],
+                max_srl_sites=arguments.get("max_srl_sites", 32),
+                max_ce_clone_sites=arguments.get("max_ce_clone_sites", 16),
+            )
+
+        elif name == "recover_fixed_point_contract":
+            result = rw.recover_fixed_point_contract(
+                max_candidates=arguments.get("max_candidates", 8),
+            )
+
+        elif name == "recover_registered_product_sum_contract":
+            result = rw.recover_registered_product_sum_contract(
+                max_candidates=arguments.get("max_candidates", 16),
+                preferred_output_cells=arguments.get(
+                    "preferred_output_cells", []
+                ),
+                timeout_ms=arguments.get("timeout_ms", 30000),
+            )
+
+        elif name == "propose_fixed_point_placement_candidates":
+            result = rw.propose_fixed_point_placement_candidates(
+                region_sha256=arguments["region_sha256"],
+                max_sites=arguments.get("max_sites", 64),
+            )
+
+        elif name == "recover_two_operand_contract":
+            result = rw.recover_two_operand_contract(
+                max_candidates=arguments.get("max_candidates", 8),
+            )
+
+        elif name == "propose_two_operand_placement_candidates":
+            result = rw.propose_two_operand_placement_candidates(
+                region_sha256=arguments["region_sha256"],
+                max_sites=arguments.get("max_sites", 64),
+            )
+
+        elif name == "recover_register_absorb_contract":
+            result = rw.recover_register_absorb_contract(
+                max_candidates=arguments.get("max_candidates", 8),
+            )
+
+        elif name == "recover_pipeline_rebalance_contract":
+            result = rw.recover_pipeline_rebalance_contract(
+                max_candidates=arguments.get("max_candidates", 8),
+            )
+
+        elif name == "recover_memory_primitive_contracts":
+            result = rw.recover_memory_primitive_contracts(
+                max_candidates=arguments.get("max_candidates", 64),
+            )
+
+        elif name == "recover_memory_consumer_dependencies":
+            result = rw.recover_memory_consumer_dependencies(
+                max_candidates=arguments.get("max_candidates", 64),
+            )
+
+        elif name == "find_proven_equivalent_sources":
+            result = rw.find_proven_equivalent_sources(
+                critical_paths_data=arguments["critical_paths_data"],
+                max_candidates=arguments.get("max_candidates", 4),
+                min_distance=arguments.get("min_distance", 1),
+            )
+
+        elif name == "selective_unroute_sink_branches":
+            result = rw.selective_unroute_sink_branches(
+                connections=arguments["connections"]
+            )
+
+        # Internal skill-only mutation. It accepts only a complete certificate
+        # issued by the exact loaded session; the Agent never exposes it as an
+        # LLM-selectable probe.
+        elif name == "rewire_sink_to_proven_source":
+            result = rw.rewire_sink_to_proven_source(
+                certificate=arguments["certificate"]
+            )
+
+        # Internal skill-only mutation. Catalog registration keeps MCP schema
+        # validation aligned; the Agent still does not expose it as an
+        # LLM-selectable probe or accept public object paths.
+        elif name == "relocate_structure_cluster":
+            result = rw.relocate_structure_cluster(
+                structure=arguments["structure"],
+                expected_digest=arguments["expected_digest"],
+                tile_col_offset=arguments["tile_col_offset"],
+                tile_row_offset=arguments["tile_row_offset"],
+                max_boundary_nets=arguments.get("max_boundary_nets", 16),
+                max_boundary_pins=arguments.get("max_boundary_pins", 128),
+            )
         
         elif name == "optimize_fanout":
             result = rw.optimize_fanout(
@@ -649,7 +1498,13 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 target_ff_count=arguments["target_ff_count"],
                 target_dsp_count=arguments.get("target_dsp_count", 0),
                 target_bram_count=arguments.get("target_bram_count", 0),
+                target_uram_count=arguments.get("target_uram_count", 0),
                 device_name=arguments.get("device_name")
+            )
+
+        elif name == "analyze_clock_region_pblock_grid":
+            result = rw.analyze_clock_region_pblock_grid(
+                critical_cell_names=arguments.get("critical_cell_names", [])
             )
         
         elif name == "convert_fabric_region_to_pblock":
@@ -671,7 +1526,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         elif name == "analyze_net_detour":
             result = rw.analyze_net_detour(
                 critical_paths_data=arguments.get("critical_paths_data"),
-                detour_threshold=arguments.get("detour_threshold", 2.0),
+                detour_threshold=arguments.get("detour_threshold", float(_tool_param("detour_threshold", 2.0))),
                 input_file=arguments.get("input_file")
             )
         
@@ -685,7 +1540,7 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             result = rw.optimize_critical_path_detours(
                 critical_paths_data=arguments.get("critical_paths_data"),
                 input_file=arguments.get("input_file"),
-                detour_threshold=arguments.get("detour_threshold", 2.0),
+                detour_threshold=arguments.get("detour_threshold", float(_tool_param("detour_threshold", 2.0))),
                 max_candidates=arguments.get("max_candidates", 5),
                 clock_period_ns=arguments.get("clock_period_ns"),
             )

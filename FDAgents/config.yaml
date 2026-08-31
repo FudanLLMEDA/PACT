@@ -1,0 +1,504 @@
+# ============================================================================
+# FDAgents configuration — single source of every tunable value.
+#
+# Precedence (highest wins):
+#   1. CLI flags (--model, --time-limit, ...)
+#   2. Environment variables (FDAGENTS_MODEL, FDAGENTS_TOKEN_BUDGET, ...)
+#   3. A YAML file pointed to by FDAGENTS_CONFIG
+#   4. This file (packaged defaults)
+#
+# Contest scoring context (docs/score.md):
+#   score = dFmax_MHz * (1 - 0.1*cost_usd - 0.1*runtime_s/3600)
+#   -> Fmax gain dominates; a full hour costs 10% of the gain, $1 costs 10%.
+#   -> validation failure (unrouted / behavior change / hold or pulse-width
+#      violation) scores ZERO. Legality is absolute.
+# ============================================================================
+
+llm:
+  # Development default. In the contest harness OPENROUTER_API_KEY is set and
+  # the client automatically switches to https://openrouter.ai/api/v1 and
+  # prefixes the model with "openai/" when needed.
+  model: "gpt-5.6-luna"
+  token_budget_usd: 1.0
+  # Native reasoning effort per stage (Responses API `reasoning.effort`).
+  stages:
+    analyze: {effort: high,   max_output_tokens: 8000}
+    decide:  {effort: medium, max_output_tokens: 4000}
+    probe:   {effort: high,   max_output_tokens: 8000}
+    report_analysis: {effort: high, max_output_tokens: 6000}
+    knowledge_research: {effort: high, max_output_tokens: 2500}
+    action_menu_selection: {effort: medium, max_output_tokens: 2000}
+    replay_selection: {effort: medium, max_output_tokens: 1000}
+    reconsider: {effort: high, max_output_tokens: 4000}
+  retry:
+    attempts: 6
+    initial_delay_s: 5
+    max_delay_s: 60
+  request_timeout_s: 300
+  # USD per 1K tokens; used when the provider does not return cost directly.
+  # OpenRouter standard-endpoint rates verified 2026-07-31. Luna and Terra
+  # include the current 50% price reduction.
+  pricing:
+    "gpt-5.6-luna":  {input: 0.0001, cached_input: 0.00001, output: 0.0006}
+    "gpt-5.6-terra": {input: 0.001,  cached_input: 0.0001,  output: 0.006}
+    "gpt-5.6-sol":   {input: 0.005,  cached_input: 0.0005,  output: 0.030}
+    "gpt-5.5":       {input: 0.005,  cached_input: 0.0005,  output: 0.030}
+    "gpt-4o-mini":   {input: 0.00015, output: 0.0006}
+
+platform:
+  # Configured execution-profile label; this is not hardware autodetection.
+  id: "fpl26-reference-vivado-2025.1"
+
+# Pure one-hour replay policy. Action templates and target mechanics are owned
+# by FDAgents/replay.py and intentionally cannot be supplied by configuration.
+replay:
+  policy_id: generic_basin_then_semantics_v1
+  deadlines_s:
+    characterize: 300
+    basin: 1200
+    semantics: 2700
+    closeout: 3000
+    submission: 3600
+  thresholds:
+    # All thresholds are benchmark-independent aggregate feature rules.
+    minimum_feature_count: 2
+    route_dominated_min_ratio: 0.55
+    high_util_min_pct: 70.0
+    deep_logic_min_levels: 8
+    high_fanout_min_count: 1
+    clock_fallback_max_closure_ratio: -0.05
+    semantic_preflight_max_age_s: 300
+    low_gain_max_delta_mhz: 0.01
+    saturation_minimum_consecutive: 2
+
+run:
+  time_limit_s: 3600
+  # Wall-clock reserve for the final save/copy before the harness kills us.
+  # Aligned with the validated campaign value. This is still a scale-independent
+  # constant: finalization copies and republishes the winning checkpoint, so the
+  # true cost scales with checkpoint size (measured inputs range from 1.7 MB to
+  # 145 MB). Deriving it from the current artifact is tracked separately.
+  # Reserve for the tail after the last action.  Measured across runs that
+  # ended having promoted a candidate on the largest designs, that tail is
+  # 370s at worst; at 600 every run ended holding 599-894s it never used,
+  # taken out of the window of every action.  Matches the value this
+  # campaign verified in configs/development_canary.yaml.
+  time_safety_s: 480
+  # Not binding under staged ReAct: the decision loop continues while the stage
+  # pipeline is enabled and is bounded by the time reserve and token budget.
+  max_rounds: 8
+  # Mechanics, not policy: a checkpoint is "better" only above this delta.
+  accept_min_delta_ns: 0.0005
+  candidate_beam_width: 3
+  # Independently retained, measured non-improving substrates for one bounded
+  # follow-up action. These are not Fmax promotions or optimization results.
+  enabling_candidate_pool_width: 4
+  enabling_composition_max_depth: 2
+  enabling_residual_regression_tolerance_ns: 0.01
+  enabling_local_improvement_epsilon_ns: 0.0005
+  # Promotion compares authoritative Fmax, including across clock frames.
+  promotion_min_delta_mhz: 0.01
+  # One selected seed may yield at most this many sibling DCP outputs.
+  max_skill_candidates_per_action: 4
+  candidate_beam_diversity_enabled: true
+  candidate_beam_diversity_min_common_dimensions: 4
+  candidate_commit_reserve_s: 120
+  central_measurement_estimate_s: 15
+  # Consecutive illegal/veto LLM actions before safely stopping LLM mode.
+  # Explicit --no-llm mode continues to use its deterministic fallback plan.
+  max_consecutive_vetoes: 3
+
+# Experimental A5 proof/implementation overlap. Disabled until the G2 split
+# backends land. Timeout ownership is mechanical: QF_BV is tight, ROBDD gets a
+# larger canonicalization budget, and SAT hard timeout is reported as unknown.
+concurrent_proof:
+  enabled: true
+  cheap_replay_vectors: 512
+  vm_slot: "local"
+  timeouts_s:
+    qf_bv: 120
+    robdd: 480
+    sat: 240
+
+# MENU-001: every exact staged telemetry epoch deep-closes and eagerly proves
+# the highest-ranked current-seed families, then Decision selects one exact ID.
+action_menu:
+  top_k: 4
+  max_build_retries: 1
+
+saturation:
+  level1:
+    enabled: true
+    # Seed-local centrally measured Fmax gain, never WNS across clock frames.
+    low_gain_max_delta_mhz: 0.01
+    minimum_consecutive: 2
+    # Empty means each canonical skill is its own explicit strategy family.
+    strategy_family_by_skill: {}
+    max_scopes_in_llm_state: 12
+
+artifacts:
+  # Level 1 retains root, global best, active beam, metadata, and final output.
+  level1_gc_enabled: false
+
+equivalence:
+  vectors: 1000
+  precheck_vectors: 100
+  # Submission mode stops search early enough to run strict final validation.
+  # Submission mode raises run.time_safety_s to this floor, and it is the
+  # only thing this key does.  At 600 it overrode the 480 that was measured
+  # against the worst tail on record -- 370s on boom_soc -- so every scored
+  # action ran with 120s it would never use.
+  time_reserve_s: 480
+
+score_scheduling:
+  enabled: true
+  calibration_history_limit: 24
+  calibration_records_in_llm_state: 8
+
+# Neutral final review of one canonical action. The registry contains only
+# centrally measured facts; an empty path keeps evidence local to the run.
+action_review:
+  enabled: true
+  registry_path: ""
+  registry_max_records: 128
+  transaction_history_limit: 64
+  exact_history_limit: 1
+  family_history_limit: 4
+
+# Optional learned predictor in shadow mode. Its output is persisted for offline
+# calibration but is never included in an LLM prompt or used to select/veto/stop.
+bo:
+  enabled: false
+  model_root: "predictors/unified_final_predictor_20260710"
+  runtime_python: "python3"
+  timeout_s: 120
+  time:
+    enabled: true
+    model_root: "predictors/unified_time_predictor_20260710"
+    reserve_s: 300
+
+submission:
+  validator_timeout_s: 480
+  export_guard_s: 30
+  process_kill_grace_s: 10
+  max_artifact_bytes: 4294967296
+  max_evidence_bytes: 67108864
+
+analysis:
+  # Cold complete-family census is optional decision telemetry. It must return
+  # typed partial/unavailable rows rather than consume the one-hour run wall.
+  # The preflight budget is wall-clock, so a slower machine gets fewer
+  # families out of it.  Scored, optical-flow spends 58.8s + 14.6s + 54.6s on
+  # its first two closure families and the third would need about 55s more --
+  # 183s against a 180s budget -- so collection stops after two, no decision
+  # packet is built, and the family-slice retry reports "no exact-seed
+  # decision packet".  The same design fits three families in 130s here and
+  # takes the registered product-sum rewrite twice for +88.00 MHz; scored it
+  # falls to lut_merge and ends at +0.42.  300 is the value this function
+  # defaults to on its own, and it leaves headroom on a slower instance
+  # without changing what a fast one does.
+  registered_product_sum_preflight_budget_s: 300
+  registered_product_sum_family_deadline_s: 180
+  candidate_signature_num_paths: 20
+  candidate_signature_timeout_s: 60
+  # Initial design probing depth.
+  fanout_num_paths: 50
+  fanout_min_fanout: 20
+  profile_num_paths: 40
+
+legality:
+  contest_clock: clk_fpl26contest
+  require_fully_routed: true
+  # Hold / pulse-width violations score zero -> checked on every accept.
+  require_hold_clean: true
+  require_pulse_width_clean: true
+  # Custom (deep-probe) MCP calls per run. A probe is cheap but not free.
+  custom_call_budget: 12
+  # Probe calls are fail-closed by server and exact named tool. These tools
+  # query the live design/session without mutating it or producing candidates.
+  allowed_custom_tools:
+    vivado:
+      - report_route_status
+      - report_timing_summary
+      - get_wns
+      - get_critical_high_fanout_nets
+      - extract_critical_path_cells
+      - extract_critical_path_pins
+      - report_timing_path_profile
+      - report_utilization_for_pblock
+      - analyze_carry_clouds
+      - analyze_hard_macro_cascades
+      - suggest_slice_pblock_ranges
+      - screen_fixed_point_dsp_contract
+      - recover_banked_select_predicate_contract
+      - recover_banked_ram_operator_contract
+      - recover_commutative_reassociation_contract
+      - recover_registered_dsp_lane_contract
+      - recover_control_to_data_state_equation_contract
+      - recover_ff_srl_boundary_bridge_contract
+      - recover_memory_write_buffer_forward_contract
+      - recover_multilevel_control_distribution_contract
+      - recover_registered_parity_reassociation_contract
+    rapidwright:
+      - get_supported_devices
+      - get_device_info
+      - report_approx_timing
+      - get_design_info
+      - search_cells
+      - get_tile_info
+      - search_sites
+      - inspect_lut_pin_swap_candidates
+      - analyze_critical_path_spread
+      - analyze_fabric_for_pblock
+      - convert_fabric_region_to_pblock
+      - analyze_net_detour
+      - analyze_route_connections
+      - operator_mining
+      - recover_recurrence_contract
+      - recover_sequential_operator_contract
+      - recover_consumer_driven_operator_contract
+      - recover_registered_dead_state_contract
+      - find_proven_equivalent_sources
+  # Tcl fragments that must never be issued by the LLM through the `custom`
+  # skill: they would change functional behavior, target the wrong objects,
+  # or corrupt the evaluation environment.
+  forbidden_tcl_patterns:
+    - "synth_design"          # re-synthesis changes the netlist -> equivalence risk
+    - "write_bitstream"       # pointless + slow
+    - "set_property\\s+(?i:generic)"  # changes elaboration parameters
+    - "create_clock(?![\\w-])"        # replacing the contest clock is illegal
+    - "remove_clock"
+    - "rename_clock"
+    - "delete_clock"
+    - "set_false_path(?!.*clk_as_data)"  # blanket false-path fakes timing
+    - "set_clock_groups"
+    - "set_max_delay"
+    - "set_min_delay"
+    - "set_multicycle_path"
+    - "disconnect_net"
+    - "remove_cell"
+    - "remove_net"
+    - "remove_port"
+    - "exec\\s"               # arbitrary shell escape
+    - "(?i)(^|[;\\[\\s])(?:::)?open\\s"    # Tcl files and shell pipelines
+    - "(?i)(^|[;\\[\\s])(?:::)?source\\s"  # arbitrary Tcl file execution
+    - "(?i)(^|[;\\[\\s])(?:::)?load\\s"    # native extension loading
+    - "(?i)(^|[;\\[\\s])(?:::)?socket\\s"  # network escape
+    - "(?i)(^|[;\\[\\s])(?:::)?package\\s+require\\s+(?:http|tls)"
+    - "(?i)(^|[;\\[\\s])(?:::)?file\\s+(?:copy|rename|delete|mkdir|link|attributes)\\s"
+    - "file\\s+delete"
+  # Defense-in-depth in addition to the allowlist above.
+  forbidden_custom_tools:
+    - "close_checkpoint"      # would drop the working design
+
+skills:
+  # Per-skill default params, merged under any LLM-provided params.
+  # (LLM params win; these are just sensible starting points.)
+  defaults:
+    fanout_opt:
+      split_factor: 3
+    force_replicate:
+      passes: 1
+      unroute_scope: global
+      route_directive: Default
+      num_paths: 24
+      max_nets: 18
+      max_nets_cap: 64
+      nets_per_path: 1.0
+      endpoint_min_fanout: 4
+      fallback_min_fanout: 64
+      fallback_min_fanout_floor: 24
+      fanout_reference_paths: 12
+    per_net_unroute:
+      num_paths: 5
+      min_fanout: 20
+      max_fanout: 100
+      replication_passes: 2
+      route_timeout_s: 1800
+    fresh_place_route:
+      max_candidates: 2
+    clock_tighten:
+      factors: [0.92, 0.88, 0.84]
+      max_candidates: 3
+      max_fmax_mhz: 0.0
+      recipe_timeout_s: 1800
+    pblock_sweep:
+      max_candidates: 4
+    post_route_cleanup:
+      max_candidates: 8
+      max_iterations: 2
+    critical_net_reroute:
+      max_fanout: 80
+      window_size: 4
+      boundary_num_paths: 32
+      boundary_max_fanout: 96
+    selective_branch_reroute:
+      max_branches: 2
+      max_candidates: 4
+      num_paths: 8
+      min_detour_ratio: 1.3
+      route_directives: [Default]
+    structure_relocation:
+      structure_id: auto
+      offsets: [[0, 1], [0, -1], [1, 0], [-1, 0]]
+      max_candidates: 4
+      route_directive: Default
+    equivalent_source_remap:
+      max_candidates: 8
+      min_distance: 1
+    operator_rewrite:
+      max_candidates: 1
+      route_timeout_s: 1800
+      min_candidate_remaining_s: 900
+    semantic_replay:
+      max_candidates: 1
+      implementation_timeout_s: 2400
+      validation_timeout_s: 1800
+      validation_reserve_s: 900
+      min_candidate_remaining_s: 0
+    lut_pin_swap:
+      num_paths: 5
+      max_pins: 6
+      max_cells: 4
+      max_iterations: 5
+    endpoint_bel_move:
+      num_paths: 20
+      max_candidates: 6
+    hard_macro_move:
+      num_paths: 20
+      max_candidates: 4
+      max_site_distance: 6
+      attempt_timeout_s: 1800
+      min_candidate_remaining_s: 300
+    critical_cluster_anchor:
+      num_paths: 12
+      max_cells: 24
+      max_cells_cap: 96
+      cells_per_path: 4
+      max_nets: 12
+      max_nets_cap: 48
+      nets_per_path: 2
+      bbox_pad_x: 4
+      bbox_pad_y: 8
+      bbox_pad_x_per_scale: 2
+      bbox_pad_y_per_scale: 4
+  # Conservative first-attempt wall-clock estimates (seconds). The mechanical
+  # execution-window gate enforces these until centrally measured same-run
+  # action/validation cycles calibrate the corresponding skill.
+  runtime_estimates_s:
+    # Conservative platform envelopes from cold current-seed development
+    # cycles.  These are scheduling costs only: they contain no design
+    # identity, selector, parameter, or action-order authority.  The Agent
+    # still replaces them with the 1.5x same-run upper envelope after a skill
+    # has a committed measurement on the current run.
+    phys_opt: 180
+    implementation_recipe: 1800
+    fanout_opt: 300
+    cell_replace: 420
+    lut_merge: 420
+    # Full pin-swap searches vary sharply with routed design size; preserve a
+    # long-mechanism launch window until the current run measures otherwise.
+    lut_pin_swap: 900
+    per_net_unroute: 240
+    critical_net_reroute: 600
+    selective_branch_reroute: 600
+    structure_relocation: 900
+    equivalent_source_remap: 900
+    semantic_replay: 3000
+    critical_cluster_anchor: 700
+    endpoint_bel_move: 600
+    hard_macro_move: 900
+    post_route_cleanup: 300
+    pblock_sweep: 1500
+    pblock: 1500
+    force_replicate: 1600
+    fresh_place_route: 1500
+    clock_tighten: 1800
+    checkpoint_import: 300
+    path_local_lut_reflow: 700
+    custom: 60
+  candidate_runtime_estimates_s:
+    fresh_place_route: 750
+    structure_relocation: 225
+    hard_macro_move: 225
+    equivalent_source_remap: 225
+    semantic_replay: 3000
+
+knowledge:
+  # Paths are resolved relative to the FDAgents package directory unless
+  # absolute. Additional user case files can be appended via env
+  # FDAGENTS_KNOWLEDGE_PATHS (colon-separated).
+  #
+  # The submission entrypoint (`make run_optimizer`) supplies no config
+  # override, so these defaults are what a scored run actually uses. The
+  # historical case library carries benchmark names in its evidence fields; on
+  # a hidden benchmark it either fails to match and wastes prompt budget, or
+  # matches and steers by identity. Neither is admissible, so the default is
+  # the empty corpus. The generic operator taxonomy remains available.
+  cases_path: knowledge/no_replay_empty_cases.yaml
+  skills_guide_path: knowledge/no_replay_empty_skills_guide.yaml
+  max_cases_in_prompt: 0
+  min_match_score: 1.0
+
+react:
+  enabled: true
+  # The Knowledge stage classifies the Report diagnosis against a generic
+  # operator taxonomy. Measured one-hour runs spent 269-282s and 33-34 tool
+  # turns on it to grep a 202-line immutable document, and its only product is
+  # a level label that no ranking, selection, or parameterization step reads.
+  # That window is worth more as action execution, so the stage is off by
+  # default. Enable it only once the label has a formal consumer.
+  knowledge_stage_enabled: false
+  # Hard wall for each Knowledge stage. Deadline exhaustion emits a typed
+  # partial record and continues to Decision; it is never a fatal empty result.
+  knowledge_stage_budget_s: 60
+  # A provider transport, schema, or availability rejection is an
+  # infrastructure outcome, not a reasoning outcome: the stage never produced a
+  # decision, so the remaining time and token budget are still usable. Retry the
+  # decision round this many times before retiring the run.
+  provider_failure_retries: 3
+  # `auto` works with both OpenAI Responses and OpenRouter. Terminal function
+  # calls remain mandatory and are validated locally before any EDA action.
+  tool_choice: auto
+  max_tool_turns: 12
+  # Per-stage ceilings. Measured 1h runs showed knowledge_research burning
+  # 9-13 turns and 80-212k input tokens *every* reasoning cycle, which is ~95%
+  # of per-cycle cost, exhausting the whole $1 budget at ~1200s of a 3600s run
+  # and leaving no budget to decide on or execute an actual optimization.
+  stage_max_tool_turns:
+    report_analysis: 8
+    knowledge_research: 4
+  # Terminal-only turns may repair rejected citations or registry bindings.
+  # These carry no grep output, so they are far cheaper than retrieval turns and
+  # must not compete with them for the shared ceiling.
+  terminal_repair_turns: 4
+  # Bound mechanical exact-seed reprofiling when the model repeatedly changes seed.
+  max_seed_switches_per_decision: 2
+  grep:
+    # Pattern length does not affect response size; the output bounds below do.
+    # A short ceiling only cost retrieval turns on rejected alternations.
+    max_pattern_chars: 400
+    max_files: 16
+    max_matches_per_call: 40
+    # Sized so a full stage can spend its whole call quota:
+    # max_calls_research_stage * max_output_bytes_per_call == max_total_output_bytes.
+    # A larger per-call limit let four calls starve every later grep in the
+    # stage, which then failed with "output limit is too small".
+    max_output_bytes_per_call: 6400
+    max_context_lines: 3
+    max_line_chars: 2000
+    timeout_s: 2
+    max_calls_report_stage: 8
+    max_calls_research_stage: 10
+    max_total_output_bytes: 64000
+
+# Tool-layer tunables (read by the MCP servers via FDAGENTS_CONFIG).
+vivado_mcp:
+  high_fanout_min_fanout: 100
+  pblock_resource_multiplier: 1.5
+  pblock_expand_factor: 1.5
+  spread_span_x_threshold: 30
+  spread_span_y_threshold: 50
+
+rapidwright_mcp:
+  detour_threshold: 2.0

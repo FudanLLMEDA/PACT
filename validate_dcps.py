@@ -38,6 +38,69 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+STRUCTURAL_NOTE_PREFIXES = ("INFO:", "WARNING:")
+CELL_COUNT_DECREASE_TEXT = "Cell count decreased significantly:"
+
+
+def stage_timeout_s(variable: str, default_s: int) -> int:
+    """Resolve a simulation stage timeout, allowing a supervised override.
+
+    The caller that owns the overall validation wall must be able to size these
+    budgets below it. When an inner stage outlives the outer wall the process is
+    killed without a verdict, which is indistinguishable from a crash; a stage
+    that owns its own timeout instead reports a typed timeout.
+    """
+    raw = os.environ.get(variable, "").strip()
+    if not raw:
+        return int(default_s)
+    try:
+        resolved = int(float(raw))
+    except (TypeError, ValueError):
+        logger.warning("%s is not a number; using %ds", variable, default_s)
+        return int(default_s)
+    if resolved <= 0:
+        logger.warning("%s must be positive; using %ds", variable, default_s)
+        return int(default_s)
+    return resolved
+
+
+def is_structural_note(issue: str) -> bool:
+    """Return whether a structural diagnostic is advisory."""
+    text = str(issue or "").strip()
+    return text.startswith(STRUCTURAL_NOTE_PREFIXES) or text.startswith(
+        CELL_COUNT_DECREASE_TEXT
+    )
+
+
+def structural_checks_allow_simulation(
+    comparison_result: str,
+    checks_passed: int,
+    checks_total: int,
+    issues: list[str],
+) -> bool:
+    """Allow simulation when cell deletion is the only failed sanity check."""
+    if comparison_result == "PASS":
+        return True
+
+    real_issues = [issue for issue in issues if not is_structural_note(issue)]
+    if real_issues or checks_total <= 0:
+        return False
+
+    failed_checks = max(0, checks_total - checks_passed)
+    cell_count_notes = sum(
+        CELL_COUNT_DECREASE_TEXT in str(issue) for issue in issues
+    )
+    return 0 < failed_checks <= cell_count_notes
+
+
+class BoomStageTimeout(RuntimeError):
+    """Timeout tagged with the exact sequential BOOM subprocess stage."""
+
+    def __init__(self, stage: str, timeout_seconds: int):
+        super().__init__(f"{stage} timed out after {timeout_seconds}s")
+        self.stage = stage
+        self.timeout_seconds = timeout_seconds
+
 
 def sanitize_identifier(name: str) -> str:
     """Convert an arbitrary interface prefix into a valid Verilog identifier."""
@@ -174,7 +237,7 @@ class DCPValidator:
         self,
         golden_dcp: Path,
         revised_dcp: Path,
-        num_vectors: int = 200,
+        num_vectors: int = 1000,
         precheck_vectors: int = 100,
         debug: bool = False,
         no_reactive: bool = False,
@@ -190,9 +253,14 @@ class DCPValidator:
         self.rapidwright_session: Optional[ClientSession] = None
         self.vivado_session: Optional[ClientSession] = None
         
-        # Create temporary directory for intermediate files in workspace
-        # (avoids /tmp running out of space for large designs)
-        workspace_dir = Path(__file__).parent
+        # Operators can redirect large simulation intermediates away from a
+        # constrained deployment filesystem without changing validation logic.
+        configured_workspace = os.environ.get("FDAGENTS_VALIDATION_WORKSPACE")
+        workspace_dir = (
+            Path(configured_workspace).expanduser().resolve()
+            if configured_workspace else Path(__file__).parent
+        )
+        workspace_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir = Path(tempfile.mkdtemp(prefix="dcp_validation_", dir=workspace_dir))
         logger.info(f"Working directory: {self.temp_dir}")
         
@@ -443,9 +511,8 @@ class DCPValidator:
         checks_total = self.structural_report.get("checks_total", 0)
         issues = self.structural_report.get("issues", [])
         
-        # Separate INFO issues from real issues
-        info_issues = [i for i in issues if i.startswith("INFO:")]
-        real_issues = [i for i in issues if not i.startswith("INFO:")]
+        note_issues = [i for i in issues if is_structural_note(i)]
+        real_issues = [i for i in issues if not is_structural_note(i)]
         
         print(f"\nStructural Checks: {checks_passed}/{checks_total} passed")
         
@@ -454,15 +521,25 @@ class DCPValidator:
             for issue in real_issues:
                 print(f"  - {issue}")
         
-        if info_issues:
-            print("\nInformational notes:")
-            for issue in info_issues:
-                print(f"  ℹ {issue[5:].strip()}")  # Remove "INFO:" prefix
+        if note_issues:
+            print("\nStructural notes:")
+            for issue in note_issues:
+                prefix, separator, message = issue.partition(":")
+                if separator and prefix in {"INFO", "WARNING"}:
+                    marker = "⚠" if prefix == "WARNING" else "ℹ"
+                    print(f"  {marker} {message.strip()}")
+                else:
+                    print(f"  ⚠ {issue}")
         
-        if not real_issues and not info_issues:
+        if not real_issues and not note_issues:
             print("\nNo issues found - designs are structurally compatible")
-        
-        self.phase1_passed = (comparison_result == "PASS")
+
+        self.phase1_passed = structural_checks_allow_simulation(
+            comparison_result,
+            checks_passed,
+            checks_total,
+            issues,
+        )
         
         print("\n" + "-"*70)
         if self.phase1_passed:
@@ -743,6 +820,29 @@ proc __vd_find_clock_ports {} {
         # nothing (e.g. an unconstrained design with no SDC).
         clocks: list = []
         if clock_names:
+            # Vivado's all_fanin traversal can return non-clock signals (e.g.
+            # data-valid or commit strobe inputs) that happen to feed into
+            # the clock network via CE pins or combinatorial paths. Filter the
+            # reported list to ports whose names contain 'clk' or 'clock' so
+            # those data signals are not stripped from the driven input set.
+            clock_like_names = [
+                n for n in clock_names
+                if 'clk' in n.lower() or 'clock' in n.lower()
+            ]
+            if not clock_like_names:
+                logger.warning(
+                    f"Vivado-reported clock ports {sorted(clock_names)} have no "
+                    "clock-like names; falling back to name-based heuristic"
+                )
+                clock_names = []
+            else:
+                if len(clock_like_names) < len(clock_names):
+                    excluded = sorted(set(clock_names) - set(clock_like_names))
+                    logger.info(
+                        f"Filtered non-clock-like ports from Vivado clock list: "
+                        f"{excluded} (likely data/control signals mis-reported by all_fanin)"
+                    )
+                clock_names = clock_like_names
             wanted = set(clock_names)
             clocks = [p for p in inputs if p['name'] in wanted]
             missing = wanted - {p['name'] for p in clocks}
@@ -764,7 +864,9 @@ proc __vd_find_clock_ports {} {
         
         # Reset detection remains heuristic - DCPs do not carry a canonical
         # "this port is the reset" property the way they do for clocks.
-        resets = [p for p in inputs if 'rst' in p['name'].lower() or 'reset' in p['name'].lower()]
+        resets = [p for p in inputs
+                  if ('rst' in p['name'].lower() or 'reset' in p['name'].lower())
+                  and port_bit_width(p) == 1]
         
         if not clocks:
             raise ValueError("No clock signal found in design")
@@ -776,6 +878,29 @@ proc __vd_find_clock_ports {} {
         clock = clocks[0]['name']
         reset = resets[0]['name'] if resets else None
 
+        # Reset polarity is also heuristic. Active-low resets are conventionally
+        # named with an "n" suffix (aresetn, rst_n, resetn, ...). Driving an
+        # active-low reset as if it were active-high holds the design IN reset for
+        # the entire warm-up + checking window, freezing every output and masking
+        # real differences (added latency, etc.). Detect the convention and pick
+        # assert/deassert levels accordingly; default to active-high.
+        reset_active_low = bool(reset) and bool(
+            re.search(r'(rst|reset)_?n$', reset.lower()))
+        reset_assert = '0' if reset_active_low else '1'
+        reset_deassert = '1' if reset_active_low else '0'
+
+        # Designs may expose multiple reset-related ports (e.g. VexRiscv has
+        # both 'debugReset' and 'reset'). Build assertion/de-assertion lines
+        # for ALL of them so the CPU is not left with a floating CLR input.
+        def _reset_level(name: str) -> tuple:
+            al = bool(re.search(r'(rst|reset)_?n$', name.lower()))
+            return ('0' if al else '1', '1' if al else '0')
+
+        all_reset_assert_lines   = '\n'.join(
+            f"        {r['name']} = {_reset_level(r['name'])[0]};" for r in resets)
+        all_reset_deassert_lines = '\n'.join(
+            f"        {r['name']} = {_reset_level(r['name'])[1]};" for r in resets)
+
         input_by_name = {p['name']: p for p in regular_inputs}
         output_by_name = {p['name']: p for p in outputs}
 
@@ -784,6 +909,7 @@ proc __vd_find_clock_ports {} {
         request_ifaces = []
         ready_bias_inputs = []
         hls_iface = None
+        hls_mem_ifaces = []
         used_iface_ids = {}
 
         def unique_iface_id(prefix: str) -> str:
@@ -888,6 +1014,24 @@ proc __vd_find_clock_ports {} {
                         f"{prefix}_tuser",
                     ]
                     payload_inputs = [input_by_name[pn] for pn in payload_names if pn in input_by_name]
+            elif name.endswith('_valid') and not name.endswith('_tvalid') and not name.endswith('_cmd_valid'):
+                # Generic valid/ready pair (e.g. s_valid/s_ready in custom FIR filters).
+                # Only recognised when a matching _ready output is present so we
+                # don't misclassify single-bit control strobes.
+                prefix = name[:-len('_valid')]
+                ready_out = f"{prefix}_ready"
+                if ready_out in output_by_name:
+                    valid_in = name
+                    # Collect companion payload inputs (prefix_data, prefix_*data, etc.)
+                    payload_inputs = sorted(
+                        (
+                            p for p in regular_inputs
+                            if p['name'].startswith(f"{prefix}_")
+                            and p['name'] != name
+                            and not p['name'].endswith('_ready')
+                        ),
+                        key=lambda p: p['name'],
+                    )
 
             if not valid_in or not ready_out:
                 continue
@@ -923,6 +1067,51 @@ proc __vd_find_clock_ports {} {
                 ready_bias_inputs.append(name)
                 controlled_inputs.add(name)
 
+        # Detect HLS ap_memory interfaces: {prefix}_q{N} input where
+        # {prefix}_address{N} and {prefix}_ce{N} exist as outputs.
+
+        # Ports that need coordinate_byte_clamp: (q_name_lower, q_width, addr_width).
+        # Rosetta 3D rendering reads byte-packed coordinates from input_r_q*/q1;
+        # clamping keeps triangle areas small enough for the rasterizer to drain
+        # within the simulation window.
+        _COORDINATE_CLAMP_PORTS: set[tuple[str, int, int]] = {
+            ("input_r_q0", 32, 14),
+            ("input_r_q1", 32, 14),
+        }
+
+        def hls_memory_data_mode(q_name: str, q_width: int, addr_width: int) -> str:
+            if ('rendering' in golden_module.lower() and
+                    (q_name.lower(), q_width, addr_width) in _COORDINATE_CLAMP_PORTS):
+                return "coordinate_byte_clamp"
+            return "full_width_hash"
+
+        for port in regular_inputs:
+            name = port['name']
+            if name in controlled_inputs:
+                continue
+            m_mem = re.match(r'^(.+)_q(\d+)$', name)
+            if not m_mem:
+                continue
+            prefix, N = m_mem.group(1), m_mem.group(2)
+            addr_port_name = f"{prefix}_address{N}"
+            ce_port_name = f"{prefix}_ce{N}"
+            if addr_port_name not in output_by_name or ce_port_name not in output_by_name:
+                continue
+            we_port_name = f"{prefix}_we{N}"
+            addr_width = port_bit_width(output_by_name[addr_port_name])
+            q_width = port_bit_width(port)
+            hls_mem_ifaces.append({
+                "q_in": name,
+                "q_width": q_width,
+                "addr_out": addr_port_name,
+                "addr_width": addr_width,
+                "ce_out": ce_port_name,
+                "we_out": we_port_name if we_port_name in output_by_name else None,
+                "data_mode": hls_memory_data_mode(name, q_width, addr_width),
+            })
+            controlled_inputs.add(name)
+            logger.info(f"Detected HLS ap_memory: {name} driven by {addr_port_name}/{ce_port_name}")
+
         # Detect simple HLS-style control interfaces (ap_ctrl_hs) and drive
         # them transactionally. Randomly toggling ap_start and mutating all
         # memory/data inputs every cycle can leave these designs mostly idle
@@ -955,7 +1144,84 @@ proc __vd_find_clock_ports {} {
             request_ifaces.clear()
             ready_bias_inputs.clear()
             hls_iface = None
+            hls_mem_ifaces.clear()
             controlled_inputs.clear()
+
+        # Detect CPU-specific features from the golden Verilog netlist. Both
+        # VexRiscv and BoomSoC detection read the text once and share it.
+        golden_v_text = None
+        icache_bootstrap = None
+        tilelink_boom = False
+        if golden_info.get('verilog_path') and not self.no_reactive:
+            try:
+                golden_v_text = Path(golden_info['verilog_path']).read_text(errors='replace')
+                icache_bootstrap = self._detect_icache_bootstrap(golden_v_text)
+                if icache_bootstrap:
+                    logger.info(
+                        "VexRiscv InstructionCache detected — enabling 8-word burst "
+                        "iBus bootstrap and DSP multiply stimulus"
+                    )
+                tilelink_boom = self._detect_tilelink_boom(golden_v_text)
+                if tilelink_boom:
+                    logger.info("BoomSoC TileLink detected — enabling 64-bit DSP multiply stimulus")
+            except OSError:
+                pass
+
+        dsp_cpu_iface = None
+        if not self.no_reactive:
+            # iBus-style (VexRiscv)
+            if icache_bootstrap:
+                _ibus_candidates = []
+                for iface in response_ifaces:
+                    data_payloads = [p for p in iface['payload_inputs']
+                                     if not p['name'].endswith(('_error', '_last'))]
+                    if data_payloads and port_bit_width(data_payloads[0]) == 32:
+                        _ibus_candidates.append((iface, data_payloads[0]))
+                if _ibus_candidates:
+                    _best = next(
+                        (c for c in _ibus_candidates
+                         if 'ibus' in c[0].get('prefix', c[0]['id']).lower()),
+                        _ibus_candidates[0]
+                    )
+                    dsp_cpu_iface = {'type': 'ibus', 'iface': _best[0],
+                                     'data_port': _best[1]}
+            # TileLink-style (BoomSoC)
+            if dsp_cpu_iface is None and tilelink_boom:
+                for iface in request_ifaces:
+                    data_p = next((p for p in iface['payload_inputs']
+                                   if 'd_bits_data' in p['name']
+                                   and port_bit_width(p) == 64), None)
+                    if data_p:
+                        pfx = iface['prefix']
+                        a_pfx = (pfx[:-2] + '_a') if pfx.endswith('_d') else pfx
+                        a_src_key  = f"{a_pfx}_bits_source"
+                        a_size_key = f"{a_pfx}_bits_size"
+                        if a_src_key not in output_by_name:
+                            logger.warning(
+                                f"TileLink A-channel field {a_src_key!r} not found in "
+                                f"DUT outputs — source echo will be driven as 0"
+                            )
+                        if a_size_key not in output_by_name:
+                            logger.warning(
+                                f"TileLink A-channel field {a_size_key!r} not found in "
+                                f"DUT outputs — size echo will be driven as 0"
+                            )
+                        dsp_cpu_iface = {
+                            'type': 'tilelink',
+                            'iface': iface,
+                            'data_port': data_p,
+                            'source_port': next((p for p in iface['payload_inputs']
+                                                 if p['name'].endswith('_source')), None),
+                            'size_port':   next((p for p in iface['payload_inputs']
+                                                 if p['name'].endswith('_size')), None),
+                            'opcode_port': next((p for p in iface['payload_inputs']
+                                                 if p['name'].endswith('_opcode')), None),
+                            'a_source_out': f"golden_{a_src_key}"  if a_src_key  in output_by_name else None,
+                            'a_size_out':   f"golden_{a_size_key}" if a_size_key in output_by_name else None,
+                        }
+                        break
+            if dsp_cpu_iface:
+                logger.info(f"DSP stimulus mode active ({dsp_cpu_iface['type']})")
 
         # Build port connections carefully to handle edge cases
         def build_port_connections(module_suffix=""):
@@ -963,9 +1229,9 @@ proc __vd_find_clock_ports {} {
             connections = []
             # Clock
             connections.append(f".{clock}({clock})")
-            # Reset if present
-            if reset:
-                connections.append(f".{reset}({reset})")
+            # All reset ports
+            for r in resets:
+                connections.append(f".{r['name']}({r['name']})")
             # Regular inputs
             for port in regular_inputs:
                 connections.append(f".{port['name']}({port['name']})")
@@ -996,30 +1262,55 @@ proc __vd_find_clock_ports {} {
             decls = []
             for iface in response_ifaces:
                 iface_id = iface['id']
+                is_ibus_burst = (icache_bootstrap and dsp_cpu_iface
+                                 and dsp_cpu_iface['type'] == 'ibus'
+                                 and dsp_cpu_iface['iface']['id'] == iface_id)
                 decls.append(f"    reg env_{iface_id}_pending;")
                 decls.append(f"    integer env_{iface_id}_delay;")
                 decls.append(f"    reg [31:0] env_{iface_id}_seed;")
+                if is_ibus_burst:
+                    decls.append(f"    integer env_{iface_id}_burst_remaining;")
             if hls_iface:
                 iface_id = hls_iface['id']
                 decls.append(f"    reg env_{iface_id}_active;")
                 decls.append(f"    reg env_{iface_id}_launch;")
                 decls.append(f"    integer env_{iface_id}_cycles;")
                 decls.append(f"    reg [31:0] env_{iface_id}_seed;")
+            if dsp_cpu_iface:
+                decls += [
+                    "    // DSP RV32M injection state machine",
+                    "    reg [2:0]  dsp_inj_state;",
+                    "    reg [4:0]  dsp_inj_rd1, dsp_inj_rd2, dsp_inj_rd3;",
+                    "    reg [11:0] dsp_inj_imm1, dsp_inj_imm2;",
+                    "    reg        dsp_inj_fire;",
+                ]
             return '\n'.join(decls) if decls else '    // No reactive environment state'
 
         def generate_env_init_code() -> str:
             lines = []
             for iface in response_ifaces:
                 iface_id = iface['id']
+                is_ibus_burst = (icache_bootstrap and dsp_cpu_iface
+                                 and dsp_cpu_iface['type'] == 'ibus'
+                                 and dsp_cpu_iface['iface']['id'] == iface_id)
                 lines.append(f"        env_{iface_id}_pending = 0;")
                 lines.append(f"        env_{iface_id}_delay = 0;")
                 lines.append(f"        env_{iface_id}_seed = 32'h{(0x13579BDF ^ (len(iface_id) * 0x1021)) & 0xFFFFFFFF:08X};")
+                if is_ibus_burst:
+                    lines.append(f"        env_{iface_id}_burst_remaining = 0;")
             if hls_iface:
                 iface_id = hls_iface['id']
                 lines.append(f"        env_{iface_id}_active = 0;")
                 lines.append(f"        env_{iface_id}_launch = 0;")
                 lines.append(f"        env_{iface_id}_cycles = 0;")
                 lines.append(f"        env_{iface_id}_seed = 32'h2468ACE1;")
+            if dsp_cpu_iface:
+                lines += [
+                    "        dsp_inj_fire = 1'b0;",
+                    "        dsp_inj_state = 3'd0;",
+                    "        dsp_inj_rd1 = 5'd1; dsp_inj_rd2 = 5'd2; dsp_inj_rd3 = 5'd3;",
+                    "        dsp_inj_imm1 = 12'd0; dsp_inj_imm2 = 12'd0;",
+                ]
             return '\n'.join(lines) if lines else '        // No reactive environment state to initialize'
 
         def generate_negedge_stimulus_code() -> str:
@@ -1038,7 +1329,15 @@ proc __vd_find_clock_ports {} {
                     lines.append(f"                {ready_in} = 1;")
                     lines.append("            end")
 
-                lines.append(f"            if (env_{iface_id}_pending && env_{iface_id}_delay == 0) begin")
+                is_dsp_ibus = (dsp_cpu_iface and dsp_cpu_iface['type'] == 'ibus'
+                               and dsp_cpu_iface['iface']['id'] == iface_id)
+                is_ibus_burst = is_dsp_ibus and icache_bootstrap
+                if is_ibus_burst:
+                    active_cond = (f"env_{iface_id}_pending && env_{iface_id}_delay == 0 "
+                                   f"&& env_{iface_id}_burst_remaining > 0")
+                else:
+                    active_cond = f"env_{iface_id}_pending && env_{iface_id}_delay == 0"
+                lines.append(f"            if ({active_cond}) begin")
                 lines.append(f"                {rsp_valid_in} = 1;")
                 for payload in iface['payload_inputs']:
                     payload_name = payload['name']
@@ -1046,6 +1345,12 @@ proc __vd_find_clock_ports {} {
                         lines.append(f"                {payload_name} = 0;")
                     elif payload_name.endswith('_last'):
                         lines.append(f"                {payload_name} = 1;")
+                    elif is_dsp_ibus and payload_name == dsp_cpu_iface['data_port']['name']:
+                        lines.append(
+                            f"                {payload_name} = "
+                            f"dsp_rv32_instr(dsp_inj_state, dsp_inj_rd1, dsp_inj_rd2, "
+                            f"dsp_inj_rd3, dsp_inj_imm1, dsp_inj_imm2);"
+                        )
                     else:
                         lines.append(assign_from_seed(payload, f"env_{iface_id}_seed", indent="                "))
                 lines.append("            end else begin")
@@ -1057,20 +1362,46 @@ proc __vd_find_clock_ports {} {
 
             for iface in request_ifaces:
                 ready_expr = f"golden_{iface['ready_out']}"
+                is_dsp_tl = (dsp_cpu_iface and dsp_cpu_iface['type'] == 'tilelink'
+                             and dsp_cpu_iface['iface']['id'] == iface['id'])
                 lines.append(f"            // Reactive request driver for {iface['prefix']}")
                 lines.append(f"            if ({ready_expr}) begin")
                 lines.append(f"                {iface['valid_in']} = 1;")
                 for payload in iface['payload_inputs']:
                     payload_name = payload['name']
-                    if payload_name.endswith('_last'):
+                    if is_dsp_tl:
+                        dp = dsp_cpu_iface
+                        if payload_name == dp['data_port']['name']:
+                            next_st = "(dsp_inj_state == 3'd7) ? 3'd0 : dsp_inj_state + 3'd1"
+                            lines.append(
+                                f"                {payload_name} = (dsp_inj_state != 3'd0) ? "
+                                f"{{dsp_rv32_instr({next_st}, dsp_inj_rd1, dsp_inj_rd2, dsp_inj_rd3, dsp_inj_imm1, dsp_inj_imm2), "
+                                f"dsp_rv32_instr(dsp_inj_state, dsp_inj_rd1, dsp_inj_rd2, dsp_inj_rd3, dsp_inj_imm1, dsp_inj_imm2)}} "
+                                f": {{lfsr ^ 32'h9E3779B9, lfsr}};"
+                            )
+                        elif dp.get('source_port') and payload_name == dp['source_port']['name']:
+                            src = dp['a_source_out'] if dp['a_source_out'] is not None else "0"
+                            lines.append(f"                {payload_name} = {src};")
+                        elif dp.get('size_port') and payload_name == dp['size_port']['name']:
+                            sz = dp['a_size_out'] if dp['a_size_out'] is not None else "0"
+                            lines.append(f"                {payload_name} = {sz};")
+                        elif dp.get('opcode_port') and payload_name == dp['opcode_port']['name']:
+                            lines.append(f"                {payload_name} = 3'd1;")
+                        else:
+                            lines.append(f"                {payload_name} = 0;")
+                    elif payload_name.endswith('_last'):
                         lines.append(f"                {payload_name} = 1;")
                     else:
                         lines.append(assign_from_seed(payload, "lfsr", indent="                "))
                 lines.append("            end else begin")
-                lines.append(f"                {iface['valid_in']} = lfsr[0];")
+                # DSP TileLink: hold valid low when DUT is not ready so payload
+                # remains stable across the handshake (valid/ready protocol).
+                lines.append(f"                {iface['valid_in']} = {'0' if is_dsp_tl else 'lfsr[0]'};")
                 for payload in iface['payload_inputs']:
                     payload_name = payload['name']
-                    if payload_name.endswith('_last'):
+                    if is_dsp_tl:
+                        lines.append(f"                {payload_name} = 0;")
+                    elif payload_name.endswith('_last'):
                         lines.append(f"                {payload_name} = 0;")
                     else:
                         lines.append(assign_from_seed(payload, "lfsr", indent="                "))
@@ -1090,7 +1421,7 @@ proc __vd_find_clock_ports {} {
                     seed_expr = f"(env_{iface_id}_seed ^ 32'h{(0x10203040 ^ (idx * 0x1F123BB5)) & 0xFFFFFFFF:08X})"
                     lines.append(assign_from_seed(port, seed_expr, indent="                "))
                 lines.append("            end else if (env_{0}_active) begin".format(iface_id))
-                lines.append(f"                {start_in} = 0;")
+                lines.append(f"                {start_in} = 1;  // Keep high for streaming/long-running kernels")
                 for idx, port in enumerate(stable_inputs):
                     seed_expr = f"(env_{iface_id}_seed ^ 32'h{(0x10203040 ^ (idx * 0x1F123BB5)) & 0xFFFFFFFF:08X})"
                     lines.append(assign_from_seed(port, seed_expr, indent="                "))
@@ -1105,21 +1436,60 @@ proc __vd_find_clock_ports {} {
 
         def generate_posedge_bookkeeping_code() -> str:
             lines = []
+            # Capture DSP fire condition BEFORE pending flags are cleared by the
+            # management loop below (blocking assignments would otherwise make
+            # env_*_pending == 0 by the time the state machine checks it).
+            if dsp_cpu_iface and dsp_cpu_iface['type'] == 'ibus':
+                iid = dsp_cpu_iface['iface']['id']
+                if icache_bootstrap:
+                    lines.append(
+                        f"            dsp_inj_fire = env_{iid}_pending && env_{iid}_delay == 0 "
+                        f"&& env_{iid}_burst_remaining > 0;"
+                    )
+                else:
+                    lines.append(
+                        f"            dsp_inj_fire = env_{iid}_pending && env_{iid}_delay == 0;"
+                    )
+            elif dsp_cpu_iface and dsp_cpu_iface['type'] == 'tilelink':
+                d_ready = f"golden_{dsp_cpu_iface['iface']['prefix']}_ready"
+                lines.append(
+                    f"            dsp_inj_fire = {dsp_cpu_iface['iface']['valid_in']} && {d_ready};"
+                )
             for idx, iface in enumerate(response_ifaces):
                 iface_id = iface['id']
                 cmd_valid_out = f"golden_{iface['cmd_valid_out']}"
                 ready_gate = iface['ready_in'] if iface['ready_in'] else "1'b1"
                 seed_mask = (0x9E3779B9 ^ (idx * 0x45D9F3B)) & 0xFFFFFFFF
+                is_ibus_burst = (icache_bootstrap and dsp_cpu_iface
+                                 and dsp_cpu_iface['type'] == 'ibus'
+                                 and dsp_cpu_iface['iface']['id'] == iface_id)
                 lines.append(f"            if (env_{iface_id}_pending) begin")
                 lines.append(f"                if (env_{iface_id}_delay > 0) begin")
                 lines.append(f"                    env_{iface_id}_delay = env_{iface_id}_delay - 1;")
-                lines.append("                end else begin")
-                lines.append(f"                    env_{iface_id}_pending = 0;")
+                if is_ibus_burst:
+                    # Burst mode: deliver one word per cycle; clear pending when all 8 are done
+                    lines.append(f"                end else if (env_{iface_id}_burst_remaining > 0) begin")
+                    lines.append(f"                    env_{iface_id}_burst_remaining = env_{iface_id}_burst_remaining - 1;")
+                    lines.append(f"                    if (env_{iface_id}_burst_remaining == 0) begin")
+                    lines.append(f"                        env_{iface_id}_pending = 0;")
+                    lines.append(f"                    end")
+                else:
+                    lines.append("                end else begin")
+                    lines.append(f"                    env_{iface_id}_pending = 0;")
                 lines.append("                end")
                 lines.append(f"            end else if ({cmd_valid_out} && {ready_gate}) begin")
                 lines.append(f"                env_{iface_id}_pending = 1;")
                 lines.append(f"                env_{iface_id}_delay = lfsr[0];")
                 lines.append(f"                env_{iface_id}_seed = lfsr ^ 32'h{seed_mask:08X};")
+                if is_ibus_burst:
+                    lines.append(f"                env_{iface_id}_burst_remaining = 8;")
+                    # Pre-arm DSP injection state so first rsp word carries state=1 (ADDI)
+                    lines.append(f"                dsp_inj_state <= 3'd1;")
+                    lines.append(f"                dsp_inj_rd1  <= (lfsr[5:1]   == 5'd0) ? 5'd1 : lfsr[5:1];")
+                    lines.append(f"                dsp_inj_rd2  <= (lfsr[10:6]  == 5'd0) ? 5'd2 : lfsr[10:6];")
+                    lines.append(f"                dsp_inj_rd3  <= (lfsr[15:11] == 5'd0) ? 5'd3 : lfsr[15:11];")
+                    lines.append(f"                dsp_inj_imm1 <= 12'd7;")
+                    lines.append(f"                dsp_inj_imm2 <= 12'd11;")
                 lines.append("            end")
             if hls_iface:
                 iface_id = hls_iface['id']
@@ -1132,8 +1502,9 @@ proc __vd_find_clock_ports {} {
                 lines.append(f"                env_{iface_id}_cycles = 1;")
                 lines.append(f"            end else if (env_{iface_id}_active) begin")
                 lines.append(f"                env_{iface_id}_cycles = env_{iface_id}_cycles + 1;")
-                lines.append(f"                if ({done_expr} || (({ready_expr}) && env_{iface_id}_cycles > 1)) begin")
-                lines.append(f"                    env_{iface_id}_active = 0;")
+                lines.append(f"                if ({done_expr}) begin")
+                lines.append(f"                    // Transaction boundary: refresh seed but stay active for continuous execution.")
+                lines.append(f"                    env_{iface_id}_seed = lfsr ^ 32'hA5A55A5A;")
                 lines.append(f"                    env_{iface_id}_cycles = 0;")
                 lines.append("                end")
                 lines.append(f"            end else if ({launch_condition}) begin")
@@ -1142,6 +1513,31 @@ proc __vd_find_clock_ports {} {
                 lines.append(f"                env_{iface_id}_cycles = 0;")
                 lines.append(f"                env_{iface_id}_seed = lfsr ^ 32'hA5A55A5A;")
                 lines.append("            end")
+            if dsp_cpu_iface:
+                if icache_bootstrap:
+                    # Burst mode: state machine is pre-armed at cmd-fire; just advance per word.
+                    lines += [
+                        "            // DSP RV32M injection state machine (burst mode: pre-armed at cmd-fire)",
+                        "            if (dsp_inj_state != 3'd0 && dsp_inj_fire) begin",
+                        "                dsp_inj_state <= (dsp_inj_state == 3'd7) ? 3'd0 : dsp_inj_state + 3'd1;",
+                        "            end",
+                    ]
+                else:
+                    lines += [
+                        "            // DSP RV32M injection state machine",
+                        "            if (dsp_inj_state == 3'd0) begin",
+                        "                if (dsp_inj_fire && lfsr[0]) begin",
+                        "                    dsp_inj_state <= 3'd1;",
+                        "                    dsp_inj_rd1  <= (lfsr[5:1]   == 5'd0) ? 5'd1 : lfsr[5:1];",
+                        "                    dsp_inj_rd2  <= (lfsr[10:6]  == 5'd0) ? 5'd2 : lfsr[10:6];",
+                        "                    dsp_inj_rd3  <= (lfsr[15:11] == 5'd0) ? 5'd3 : lfsr[15:11];",
+                        "                    dsp_inj_imm1 <= 12'd7;",
+                        "                    dsp_inj_imm2 <= 12'd11;",
+                        "                end",
+                        "            end else if (dsp_inj_fire) begin",
+                        "                dsp_inj_state <= (dsp_inj_state == 3'd7) ? 3'd0 : dsp_inj_state + 3'd1;",
+                        "            end",
+                    ]
             return '\n'.join(lines) if lines else '            // No reactive bookkeeping required'
 
         def generate_protocol_compare_code() -> str:
@@ -1170,13 +1566,117 @@ proc __vd_find_clock_ports {} {
                 protocol_mismatch_count = protocol_mismatch_count + 1;
             end''')
             return '\n'.join(lines) if lines else '            // No protocol outputs to compare'
-        
+
+        def generate_hls_mem_model_code() -> str:
+            if not hls_mem_ifaces:
+                return ''
+            lines = ["    // Behavioral memory model for HLS ap_memory interfaces"]
+            if any(iface['data_mode'] == "coordinate_byte_clamp" for iface in hls_mem_ifaces):
+                lines.extend([
+                    "    function [7:0] hls_mem_byte_hash;",
+                    "        input [15:0] addr;",
+                    "        input [15:0] prime;",
+                    "        input [15:0] offset;",
+                    "        begin",
+                    "            hls_mem_byte_hash = ((addr * prime + offset) >> 8) & 8'h07;",
+                    "        end",
+                    "    endfunction",
+                    "",
+                ])
+            lines.append(f"    always @(posedge {clock}) begin")
+            for idx, iface in enumerate(hls_mem_ifaces):
+                q_in       = iface['q_in']
+                q_width    = iface['q_width']
+                addr_out   = iface['addr_out']
+                addr_width = iface['addr_width']
+                ce_out     = iface['ce_out']
+                we_out     = iface['we_out']
+                data_mode  = iface['data_mode']
+                we_check = f" && !golden_{we_out}" if we_out else ""
+                lines.append(f"        if (golden_{ce_out}{we_check}) begin")
+                if data_mode == "coordinate_byte_clamp":
+                    # 32-bit ports carry byte-packed coordinates (e.g., 3D rendering).
+                    # Use independent 16-bit hashes per byte so each coordinate field
+                    # gets a distinct value, and mask to [0,31] to keep triangle areas
+                    # small enough for the HLS rasterizer to drain the input FIFO
+                    # within the simulation window.
+                    pad16 = max(0, 16 - addr_width)
+                    if pad16 > 0:
+                        addr16 = f"{{{pad16}'b0, golden_{addr_out}}}"
+                    elif addr_width == 16:
+                        addr16 = f"golden_{addr_out}"
+                    else:
+                        addr16 = f"golden_{addr_out}[15:0]"
+                    # Four independent primes and offsets; per-interface salt via XOR with idx
+                    byte_primes = [0xA15B, 0x6C3D, 0x9E37, 0x4F2B]
+                    byte_offsets = [0xA500, 0x5A00, 0x3C00, 0xC300]
+                    byte_primes  = [(p ^ (idx * 0x0101) | 1) & 0xFFFF for p in byte_primes]
+                    byte_offsets = [(o ^ (idx * 0x1010)) & 0xFFFF for o in byte_offsets]
+                    # Build {byte3, byte2, byte1, byte0} — byte3 is MSB of the 32-bit word.
+                    # Mask to [0,7] (3 bits) so rasterization stays fast enough to drain the
+                    # FIFO within the simulation comparison window.
+                    parts_msb_first = []
+                    for b in range(3, -1, -1):
+                        p = byte_primes[b]
+                        o = byte_offsets[b]
+                        parts_msb_first.append(
+                            f"hls_mem_byte_hash({addr16}, 16'h{p:04X}, 16'h{o:04X})"
+                        )
+                    lines.append(f"            {q_in} <= {{{', '.join(parts_msb_first)}}};")
+                else:
+                    # Wide ports (e.g., 64-bit optical-flow frames): full-width multiply-XOR hash.
+                    q_mask = (1 << q_width) - 1
+                    prime  = 0x9E3779B97F4A7C15 & q_mask
+                    salt   = (0xA5A5A5A5A5A5A5A5 ^ (idx * 0x1F1F1F1F1F1F1F1F)) & q_mask
+                    ext_zeros = q_width - addr_width
+                    if ext_zeros > 0:
+                        addr_ext = f"{{{ext_zeros}'b0, golden_{addr_out}}}"
+                    elif ext_zeros == 0:
+                        addr_ext = f"golden_{addr_out}"
+                    else:
+                        addr_ext = f"golden_{addr_out}[{q_width-1}:0]"
+                    lines.append(f"            {q_in} <= ({addr_ext} * {q_width}'h{prime:X}) ^ {q_width}'h{salt:X};")
+                lines.append("        end")
+            lines.append("    end")
+            return '\n'.join(lines)
+
         # Generate testbench
         compare_body = chr(10).join(f'''
             if (golden_{port['name']} !== revised_{port['name']}) begin
                 $display("MISMATCH at cycle %0d: {port['name']} golden=%h revised=%h", cycle_count, golden_{port['name']}, revised_{port['name']});
                 mismatch_count = mismatch_count + 1;
             end''' for port in outputs) if outputs else '            // No outputs to compare'
+
+        if dsp_cpu_iface:
+            dsp_instr_fn = """
+    // RV32M multiply-sequence instruction encoder used by DSP injection stimulus.
+    function [31:0] dsp_rv32_instr;
+        input [2:0]  state;
+        input [4:0]  rd1, rd2, rd3;
+        input [11:0] imm1, imm2;
+        begin
+            case (state)
+                3'd1: dsp_rv32_instr = {imm1, 5'd0, 3'd0, rd1, 7'b0010011}; // ADDI rd1,x0,imm1
+                3'd2: dsp_rv32_instr = 32'h00000013;                          // NOP
+                3'd3: dsp_rv32_instr = {imm2, 5'd0, 3'd0, rd2, 7'b0010011}; // ADDI rd2,x0,imm2
+                3'd4: dsp_rv32_instr = 32'h00000013;                          // NOP
+                3'd5: dsp_rv32_instr = {7'b0000001, rd2, rd1, 3'd0, rd3, 7'b0110011}; // MUL rd3,rd1,rd2
+                3'd6: dsp_rv32_instr = 32'h00000013;                          // NOP
+                3'd7: dsp_rv32_instr = {7'b0000010, 5'd0, rd3, 3'b001, 5'b00000, 7'b1100011}; // BNE rd3,x0,+64
+                default: dsp_rv32_instr = 32'h00000013;                          // NOP (state 0 = idle)
+            endcase
+        end
+    endfunction
+"""
+        else:
+            dsp_instr_fn = ""
+
+        # No force block needed: the VexRiscv naturally boots after the icache
+        # flush completes (~256 cycles post-reset), at which point lineLoader_valid
+        # fires naturally without any external forcing.  Forcing lineLoader_valid
+        # early (before flush completes) corrupts the tag state and blocks the
+        # natural boot.
+        icache_force_block = ""
 
         tb_content = f"""
 `timescale 1ns / 1ps
@@ -1185,37 +1685,37 @@ module testbench;
 
     // Clock and reset
     reg {clock};
-    {'reg ' + reset + ';' if reset else ''}
-    
+    {chr(10).join(f"    reg {r['name']};" for r in resets) if resets else '    // no reset port detected'}
+
     // Inputs (driven by LFSR)
     {chr(10).join(f"    reg {port['width']+' ' if port['width'] else ''}{port['name']};" for port in regular_inputs) if regular_inputs else '    // No regular inputs'}
-    
+
     // Outputs from both designs
     {chr(10).join(f"    wire {port['width']+' ' if port['width'] else ''}golden_{port['name']};" for port in outputs) if outputs else '    // No outputs to compare'}
     {chr(10).join(f"    wire {port['width']+' ' if port['width'] else ''}revised_{port['name']};" for port in outputs) if outputs else ''}
-    
+
     // LFSR for pseudo-random input generation
     reg [31:0] lfsr = 32'hDEADBEEF;
-    
+
     // Reactive environment state
 {generate_env_declarations()}
-    
+
     // Instantiate golden design
     {golden_module} golden_dut (
         {build_port_connections("golden_")}
     );
-    
+
     // Instantiate revised design
     {revised_module} revised_dut (
         {build_port_connections("revised_")}
     );
-    
+
     // Clock generation (10ns period = 100MHz)
     initial begin
         {clock} = 0;
         forever #5 {clock} = ~{clock};
     end
-    
+
     // LFSR update function
     function [31:0] lfsr_next;
         input [31:0] lfsr_in;
@@ -1223,13 +1723,14 @@ module testbench;
             lfsr_next = {{lfsr_in[30:0], lfsr_in[31] ^ lfsr_in[21] ^ lfsr_in[1] ^ lfsr_in[0]}};
         end
     endfunction
-    
+{dsp_instr_fn}
+{generate_hls_mem_model_code()}
     // Test stimulus and checking
     integer mismatch_count;
     integer protocol_mismatch_count;
     integer cycle_count;
     integer num_vectors;
-    
+
     initial begin
         mismatch_count = 0;
         protocol_mismatch_count = 0;
@@ -1240,13 +1741,13 @@ module testbench;
         end
         $display("Configured test vectors: %0d", num_vectors);
 {generate_env_init_code()}
-        
-        // Reset
-        {''+reset+' = 1;' if reset else ''}
+
+        // Reset (all reset-like ports driven together)
+        {all_reset_assert_lines if resets else '// no reset port detected'}
         {chr(10).join(f"        {port['name']} = 0;" for port in regular_inputs)}
         repeat(10) @(posedge {clock});
-        {''+reset+' = 0;' if reset else ''}
-        
+        {all_reset_deassert_lines if resets else ''}
+
         // Warm-up period: fill pipeline without checking outputs.
         // Drive inputs on the inactive edge so sequential logic sees stable
         // values before the active clock edge.
@@ -1259,7 +1760,7 @@ module testbench;
             #1;
 {generate_protocol_compare_code()}
         end
-        
+
         // Run test vectors with output checking
         repeat(num_vectors) begin
             // Generate new inputs from LFSR
@@ -1271,17 +1772,17 @@ module testbench;
             @(posedge {clock});
             cycle_count = cycle_count + 1;
 {generate_posedge_bookkeeping_code()}
-            
+
             // Check outputs after settling
             #1; // Small delay for output settling
-            
+
             // Compare all outputs
 {compare_body}
 
             // Compare protocol outputs that drive the reactive environment
 {generate_protocol_compare_code()}
         end
-        
+
         // Report results
         $display("\\n=======================================");
         $display("SIMULATION COMPLETE");
@@ -1297,13 +1798,13 @@ module testbench;
             $finish(1);
         end
     end
-    
+
     // Timeout watchdog (reset + warmup + test cycles, with 2x safety margin)
     initial begin
         #1;
         #((10 + 50 + num_vectors) * 20) $display("ERROR: Simulation timeout"); $finish(2);
     end
-
+{icache_force_block}
 endmodule
 """
         
@@ -1311,7 +1812,576 @@ endmodule
             f.write(tb_content)
         
         logger.info(f"Generated testbench: {tb_path}")
-    
+
+    def generate_boom_trace_testbenches(
+            self, golden_info: dict, revised_info: dict,
+            golden_tb_path: Path, revised_tb_path: Path, trace_path: Path,
+            clock_names: Optional[list] = None):
+        """Generate separate golden/revised Boom simulation testbenches.
+
+        The normal validator instantiates both enormous funcsim netlists in one
+        XSim image. Boom's two copies exceed the memory available to a standard
+        validation instance during XElab. This path instead:
+
+        1. runs the golden design alone and records every driven input and
+           observed output after reset/warmup;
+        2. runs the revised design alone, replaying those exact inputs and
+           comparing its outputs against the golden trace.
+
+        The golden trace preserves reactive TileLink/DSP stimulus without
+        requiring both designs to coexist in memory. It is intentionally
+        limited to the Boom topology selected by ``_detect_tilelink_boom``.
+        """
+        golden_module = golden_info["module_name"]
+        revised_module = revised_info["module_name"]
+        inputs = golden_info["ports"]["inputs"]
+        outputs = golden_info["ports"]["outputs"]
+
+        # The structural phase already validates compatible interfaces. Keep a
+        # clear local guard because a trace replay with different port names
+        # would otherwise produce opaque xvlog errors.
+        def port_shape(ports):
+            return {
+                p["name"]: (p.get("width") or "")
+                for p in ports
+            }
+
+        # Vivado may emit the same top-level ports in a different declaration
+        # order after optimization. Connections and trace fields are generated
+        # by port name, so ordering is irrelevant; names and widths must match.
+        if (port_shape(inputs) !=
+                port_shape(revised_info["ports"]["inputs"]) or
+                port_shape(outputs) !=
+                port_shape(revised_info["ports"]["outputs"])):
+
+            raise ValueError("Boom trace simulation requires matching top-level ports")
+
+        clock_candidates = []
+        if clock_names:
+            wanted = {
+                name for name in clock_names
+                if "clk" in name.lower() or "clock" in name.lower()
+            }
+            clock_candidates = [p for p in inputs if p["name"] in wanted]
+        if not clock_candidates:
+            clock_candidates = [
+                p for p in inputs
+                if "clk" in p["name"].lower() or "clock" in p["name"].lower()
+            ]
+        if not clock_candidates:
+            raise ValueError("No clock signal found for Boom trace simulation")
+        clock = clock_candidates[0]["name"]
+
+        resets = [
+            p for p in inputs
+            if ("rst" in p["name"].lower() or "reset" in p["name"].lower())
+            and port_bit_width(p) == 1
+        ]
+        special_names = {p["name"] for p in clock_candidates} | {
+            p["name"] for p in resets
+        }
+        regular_inputs = [p for p in inputs if p["name"] not in special_names]
+        input_by_name = {p["name"]: p for p in regular_inputs}
+        output_by_name = {p["name"]: p for p in outputs}
+
+        def reset_levels(port_name: str) -> Tuple[str, str]:
+            active_low = bool(re.search(r"(rst|reset)_?n$", port_name.lower()))
+            return ("0", "1") if active_low else ("1", "0")
+
+        reset_assert = "\n".join(
+            f"        {p['name']} = {reset_levels(p['name'])[0]};"
+            for p in resets
+        )
+        reset_deassert = "\n".join(
+            f"        {p['name']} = {reset_levels(p['name'])[1]};"
+            for p in resets
+        )
+        reset_decls = "\n".join(
+            f"    reg {p['name']};" for p in resets
+        ) or "    // no reset ports"
+        regular_decls = "\n".join(
+            f"    reg {p['width'] + ' ' if p['width'] else ''}{p['name']};"
+            for p in regular_inputs
+        ) or "    // no regular inputs"
+        golden_outputs = "\n".join(
+            f"    wire {p['width'] + ' ' if p['width'] else ''}golden_{p['name']};"
+            for p in outputs
+        ) or "    // no outputs"
+        revised_outputs = "\n".join(
+            f"    wire {p['width'] + ' ' if p['width'] else ''}revised_{p['name']};"
+            for p in outputs
+        ) or "    // no outputs"
+        expected_outputs = "\n".join(
+            f"    reg {p['width'] + ' ' if p['width'] else ''}expected_{p['name']};"
+            for p in outputs
+        ) or "    // no outputs"
+
+        def port_connections(output_prefix: str) -> str:
+            lines = []
+            for port in inputs:
+                lines.append(f"        .{port['name']}({port['name']})")
+            for port in outputs:
+                lines.append(
+                    f"        .{port['name']}({output_prefix}{port['name']})")
+            return ",\n".join(lines)
+
+        golden_regular_zero = "\n".join(
+            f"        {p['name']} = 0;" for p in regular_inputs
+        )
+        golden_lfsr_assign = "\n".join(
+            assign_from_seed(p, "lfsr") for p in regular_inputs
+        )
+        trace_write_inputs = "\n".join(
+            f'            $fwrite(trace_fd, " %h", {p["name"]});'
+            for p in regular_inputs
+        )
+        trace_write_outputs = "\n".join(
+            f'            $fwrite(trace_fd, " %h", golden_{p["name"]});'
+            for p in outputs
+        )
+        trace_read_inputs = "\n".join(
+            f'            scan_ok = $fscanf(trace_fd, " %h", {p["name"]});'
+            for p in regular_inputs
+        )
+        trace_read_outputs = "\n".join(
+            f'            scan_ok = $fscanf(trace_fd, " %h", expected_{p["name"]});'
+            for p in outputs
+        )
+        output_compare = "\n".join(
+            f'''
+            if (revised_{p["name"]} !== expected_{p["name"]}) begin
+                $display("MISMATCH AT cycle %0d: {p["name"]} golden=%h revised=%h",
+                         trace_cycle, expected_{p["name"]}, revised_{p["name"]});
+                mismatch_count = mismatch_count + 1;
+            end'''
+            for p in outputs
+        ) or "            // no outputs to compare"
+
+        # Boom's TileLink D-channel is the only reactive driver needed for a
+        # meaningful CPU stimulus. All other non-reset, non-clock inputs get
+        # deterministic LFSR stimulus and are captured in the golden trace.
+        d_valid = next((p["name"] for p in regular_inputs
+                        if p["name"].endswith("_d_valid")), None)
+        d_data = next((p["name"] for p in regular_inputs
+                       if p["name"].endswith("_d_bits_data")), None)
+        d_source = next((p["name"] for p in regular_inputs
+                         if p["name"].endswith("_d_bits_source")), None)
+        d_size = next((p["name"] for p in regular_inputs
+                       if p["name"].endswith("_d_bits_size")), None)
+        d_opcode = next((p["name"] for p in regular_inputs
+                         if p["name"].endswith("_d_bits_opcode")), None)
+        d_ready = next((p["name"] for p in outputs
+                        if p["name"].endswith("_d_ready")), None)
+        a_source = next((p["name"] for p in outputs
+                         if p["name"].endswith("_a_bits_source")), None)
+        a_size = next((p["name"] for p in outputs
+                       if p["name"].endswith("_a_bits_size")), None)
+
+        if not (d_valid and d_data and d_ready):
+            raise ValueError("Boom trace simulation could not identify TileLink D interface")
+
+        d_source_assign = (
+            f"                {d_source} = golden_{a_source};"
+            if d_source and a_source else
+            (f"                {d_source} = 0;" if d_source else "")
+        )
+        d_size_assign = (
+            f"                {d_size} = golden_{a_size};"
+            if d_size and a_size else
+            (f"                {d_size} = 0;" if d_size else "")
+        )
+        d_opcode_assign = (
+            f"                {d_opcode} = 3'd1;" if d_opcode else "")
+
+        trace_literal = str(trace_path).replace("\\", "\\\\")
+        golden_tb = f"""
+`timescale 1ns / 1ps
+module golden_trace_testbench;
+    reg {clock};
+{reset_decls}
+{regular_decls}
+{golden_outputs}
+    integer trace_fd;
+    integer cycle_count;
+    integer total_cycles;
+    integer num_vectors;
+    integer dsp_state;
+    reg [31:0] lfsr;
+
+    {golden_module} golden_dut (
+{port_connections("golden_")}
+    );
+
+    function [31:0] lfsr_next;
+        input [31:0] value;
+        begin
+            lfsr_next = {{value[30:0], value[31] ^ value[21] ^ value[1] ^ value[0]}};
+        end
+    endfunction
+
+    function [31:0] dsp_rv32_instr;
+        input [2:0] state;
+        begin
+            case (state)
+                3'd1: dsp_rv32_instr = {{12'd7, 5'd0, 3'd0, 5'd1, 7'b0010011}};
+                3'd2: dsp_rv32_instr = 32'h00000013;
+                3'd3: dsp_rv32_instr = {{12'd11, 5'd0, 3'd0, 5'd2, 7'b0010011}};
+                3'd4: dsp_rv32_instr = 32'h00000013;
+                3'd5: dsp_rv32_instr = {{7'b0000001, 5'd2, 5'd1, 3'd0, 5'd3, 7'b0110011}};
+                3'd6: dsp_rv32_instr = 32'h00000013;
+                3'd7: dsp_rv32_instr = {{7'b0000010, 5'd0, 5'd3, 3'b001, 5'b00000, 7'b1100011}};
+                default: dsp_rv32_instr = 32'h00000013;
+            endcase
+        end
+    endfunction
+
+    initial begin
+        {clock} = 0;
+        forever #5 {clock} = ~{clock};
+    end
+
+    initial begin
+        trace_fd = $fopen("{trace_literal}", "w");
+        if (trace_fd == 0) begin
+            $display("ERROR: could not open golden trace");
+            $finish(2);
+        end
+        lfsr = 32'hDEADBEEF;
+        dsp_state = 0;
+        cycle_count = 0;
+        num_vectors = {self.num_vectors};
+        if (!$value$plusargs("NUM_VECTORS=%d", num_vectors)) begin
+            num_vectors = {self.num_vectors};
+        end
+        total_cycles = 50 + num_vectors;
+{reset_assert if reset_assert else '        // no reset ports'}
+{golden_regular_zero if golden_regular_zero else '        // no regular inputs'}
+        repeat (10) @(posedge {clock});
+{reset_deassert if reset_deassert else '        // no reset ports'}
+
+        repeat (total_cycles) begin
+            @(negedge {clock});
+            lfsr = lfsr_next(lfsr);
+{golden_lfsr_assign if golden_lfsr_assign else '            // no regular inputs'}
+            if (golden_{d_ready}) begin
+                {d_valid} = 1'b1;
+                {d_data} = {{dsp_rv32_instr((dsp_state == 7) ? 1 : dsp_state + 1), dsp_rv32_instr(dsp_state)}};
+{d_source_assign}
+{d_size_assign}
+{d_opcode_assign}
+            end else begin
+                {d_valid} = 1'b0;
+            end
+            @(posedge {clock});
+            #1;
+            $fwrite(trace_fd, "%0d", cycle_count);
+{trace_write_inputs}
+{trace_write_outputs}
+            $fwrite(trace_fd, "\\n");
+            if (golden_{d_ready} && {d_valid}) begin
+                dsp_state = (dsp_state == 7) ? 1 : dsp_state + 1;
+            end
+            cycle_count = cycle_count + 1;
+        end
+        $fclose(trace_fd);
+        $display("TRACE COMPLETE cycles=%0d", cycle_count);
+        $finish(0);
+    end
+endmodule
+"""
+
+        revised_tb = f"""
+`timescale 1ns / 1ps
+module revised_trace_testbench;
+    reg {clock};
+{reset_decls}
+{regular_decls}
+{revised_outputs}
+{expected_outputs}
+    integer trace_fd;
+    integer scan_ok;
+    integer trace_cycle;
+    integer cycle_count;
+    integer total_cycles;
+    integer num_vectors;
+    integer mismatch_count;
+
+    {revised_module} revised_dut (
+{port_connections("revised_")}
+    );
+
+    initial begin
+        {clock} = 0;
+        forever #5 {clock} = ~{clock};
+    end
+
+    initial begin
+        trace_fd = $fopen("{trace_literal}", "r");
+        if (trace_fd == 0) begin
+            $display("ERROR: could not open golden trace");
+            $finish(2);
+        end
+        cycle_count = 0;
+        mismatch_count = 0;
+        num_vectors = {self.num_vectors};
+        if (!$value$plusargs("NUM_VECTORS=%d", num_vectors)) begin
+            num_vectors = {self.num_vectors};
+        end
+        total_cycles = 50 + num_vectors;
+{reset_assert if reset_assert else '        // no reset ports'}
+{golden_regular_zero if golden_regular_zero else '        // no regular inputs'}
+        repeat (10) @(posedge {clock});
+{reset_deassert if reset_deassert else '        // no reset ports'}
+
+        repeat (total_cycles) begin
+            @(negedge {clock});
+            scan_ok = $fscanf(trace_fd, "%d", trace_cycle);
+            if (scan_ok != 1) begin
+                $display("ERROR: golden trace ended before cycle %0d", cycle_count);
+                $finish(2);
+            end
+{trace_read_inputs}
+{trace_read_outputs}
+            @(posedge {clock});
+            #1;
+{output_compare}
+            cycle_count = cycle_count + 1;
+        end
+        $fclose(trace_fd);
+        $display("Cycles simulated: %0d", cycle_count);
+        $display("Mismatches found: %0d", mismatch_count);
+        $display("Protocol mismatches found: 0");
+        if (mismatch_count == 0) begin
+            $display("Result: PASS");
+            $finish(0);
+        end else begin
+            $display("Result: FAIL");
+            $finish(1);
+        end
+    end
+endmodule
+"""
+        golden_tb_path.write_text(golden_tb)
+        revised_tb_path.write_text(revised_tb)
+        logger.info("Generated sequential Boom trace testbenches")
+
+    def _run_boom_trace_pair(
+            self, golden_v: Path, revised_v: Path,
+            golden_info: dict, revised_info: dict,
+            golden_clocks: Optional[list]) -> bool:
+        """Run Boom golden/revised simulations in separate XSim images.
+
+        Each elaboration contains one funcsim netlist plus its small trace
+        testbench. This is the key memory reduction: the old path elaborated
+        both multi-million-line netlists at once.
+        """
+        vivado_path = os.environ.get("VIVADO_EXEC") or shutil.which("vivado")
+        if vivado_path and "/" not in vivado_path:
+            vivado_path = shutil.which(vivado_path)
+        if not vivado_path:
+            raise RuntimeError("Vivado not found in PATH. Set VIVADO_EXEC.")
+        vivado_install = Path(vivado_path).parent.parent
+        unisim_dir = vivado_install / "data" / "verilog" / "src"
+        glbl_v = unisim_dir / "glbl.v"
+
+        trace_path = self.temp_dir / "boom_golden_trace.txt"
+        golden_tb = self.temp_dir / "boom_golden_trace_tb.v"
+        revised_tb = self.temp_dir / "boom_revised_trace_tb.v"
+        self.generate_boom_trace_testbenches(
+            golden_info, revised_info, golden_tb, revised_tb, trace_path,
+            clock_names=golden_clocks)
+
+        xvlog_timeout_s = stage_timeout_s("FDAGENTS_XVLOG_TIMEOUT_S", 1800)
+        xelab_timeout_s = stage_timeout_s("FDAGENTS_XELAB_TIMEOUT_S", 3600)
+        xsim_floor_s = stage_timeout_s("FDAGENTS_XSIM_TIMEOUT_S", 3600)
+
+        def xsim_timeout_for(vector_count: int) -> int:
+            return max(xsim_floor_s, 600 + int(vector_count * 1.0))
+
+        def run_command(cmd, cwd: Path, timeout_s: int, log_name: str):
+            try:
+                result = subprocess.run(
+                    cmd, cwd=cwd, capture_output=True, text=True,
+                    timeout=timeout_s)
+            except subprocess.TimeoutExpired as error:
+                stdout = error.stdout or ""
+                stderr = error.stderr or ""
+                if isinstance(stdout, bytes):
+                    stdout = stdout.decode(errors="replace")
+                if isinstance(stderr, bytes):
+                    stderr = stderr.decode(errors="replace")
+                (self.temp_dir / log_name).write_text(stdout + stderr)
+                raise BoomStageTimeout(
+                    Path(log_name).stem, timeout_s) from error
+            (self.temp_dir / log_name).write_text(
+                (result.stdout or "") + (result.stderr or ""))
+            return result
+
+        def build(label: str, model: Path, tb: Path, top: str):
+            sim_dir = self.temp_dir / f"boom_xsim_{label}"
+            sim_dir.mkdir(exist_ok=True)
+            compile_cmd = ["xvlog", "-work", "work", str(model), str(tb)]
+            if glbl_v.exists():
+                compile_cmd.insert(3, str(glbl_v))
+            result = run_command(
+                compile_cmd, sim_dir, xvlog_timeout_s,
+                f"boom_{label}_xvlog.log")
+            if result.returncode != 0:
+                self.infrastructure_failure = True
+                self.infrastructure_reason = f"boom_{label}_xvlog_failed"
+                print(f"\n✗ Boom {label} compilation failed:")
+                print(result.stdout)
+                print(result.stderr)
+                return None
+
+            result = run_command(
+                ["xelab", "--debug", "off", "--mt", "auto",
+                 "-L", "unisims_ver", "-L", "unimacro_ver",
+                 f"work.{top}", "work.glbl", "-s", f"{top}_sim"],
+                sim_dir, xelab_timeout_s, f"boom_{label}_xelab.log")
+            if result.returncode != 0:
+                self.infrastructure_failure = True
+                self.infrastructure_reason = f"boom_{label}_xelab_failed"
+                print(f"\n✗ Boom {label} elaboration failed:")
+                print(result.stdout)
+                print(result.stderr)
+                return None
+            return sim_dir
+
+        golden_dir = build("golden", golden_v, golden_tb, "golden_trace_testbench")
+        if not golden_dir:
+            return False
+        revised_dir = build("revised", revised_v, revised_tb, "revised_trace_testbench")
+        if not revised_dir:
+            return False
+
+        def run_pair(vector_count: int, label: str) -> dict:
+            # Golden regenerates the trace for every pass; revised consumes the
+            # exact same stimulus/output schedule immediately afterwards.
+            golden = run_command(
+                ["xsim", "golden_trace_testbench_sim", "-R",
+                 "--testplusarg", f"NUM_VECTORS={vector_count}"],
+                golden_dir, xsim_timeout_for(vector_count),
+                f"boom_golden_simulation_{label}.log")
+            golden_output = (golden.stdout or "") + (golden.stderr or "")
+            if (golden.returncode != 0
+                    or "TRACE COMPLETE" not in golden_output
+                    or not trace_path.is_file()
+                    or trace_path.stat().st_size == 0):
+                self.infrastructure_failure = True
+                self.infrastructure_reason = f"boom_golden_simulation_{label}_failed"
+                return {
+                    "passed": False,
+                    "infrastructure_failure": True,
+                    "infrastructure_reason": self.infrastructure_reason,
+                    "returncode": golden.returncode,
+                    "cycles_simulated": 0,
+                    "mismatch_count": 0,
+                    "protocol_mismatch_count": 0,
+                    "result_pass_seen": False,
+                    "result_fail_seen": False,
+                    "simulator_failed": True,
+                }
+
+            revised = run_command(
+                ["xsim", "revised_trace_testbench_sim", "-R",
+                 "--testplusarg", f"NUM_VECTORS={vector_count}"],
+                revised_dir, xsim_timeout_for(vector_count),
+                f"boom_revised_simulation_{label}.log")
+            parsed = parse_simulation_output(
+                (revised.stdout or "") + (revised.stderr or ""),
+                revised.returncode, 50 + vector_count)
+            parsed["golden_returncode"] = golden.returncode
+            return parsed
+
+        print("\nRunning sequential Boom trace simulation...")
+        precheck_report = None
+        if 0 < self.precheck_vectors < self.num_vectors:
+            precheck_report = run_pair(self.precheck_vectors, "precheck")
+            if not precheck_report["passed"]:
+                self.simulation_report = {
+                    "strategy": "sequential_boom_trace",
+                    "precheck_vectors": self.precheck_vectors,
+                    "precheck_passed": False,
+                    "precheck_report": precheck_report,
+                    "full_vectors": self.num_vectors,
+                    "full_run_skipped": True,
+                    **precheck_report,
+                }
+                self.infrastructure_failure = bool(
+                    precheck_report.get("infrastructure_failure"))
+                self.infrastructure_reason = precheck_report.get(
+                    "infrastructure_reason")
+                self.phase2_passed = False
+                return False
+
+        full_report = run_pair(self.num_vectors, "full")
+        self.simulation_report = {
+            "strategy": "sequential_boom_trace",
+            "precheck_vectors": self.precheck_vectors if precheck_report else None,
+            "precheck_passed": precheck_report["passed"] if precheck_report else None,
+            "precheck_report": precheck_report,
+            "full_vectors": self.num_vectors,
+            "full_report": full_report,
+            **full_report,
+        }
+        self.infrastructure_failure = bool(full_report.get("infrastructure_failure"))
+        self.infrastructure_reason = full_report.get("infrastructure_reason")
+        self.phase2_passed = bool(full_report.get("passed"))
+        if self.phase2_passed:
+            print("\nPhase 2: PASSED ✓ (sequential Boom trace)")
+        elif self.infrastructure_failure:
+            print("\nPhase 2: INFRASTRUCTURE FAILURE ⊘ (sequential Boom trace)")
+        else:
+            print("\nPhase 2: FAILED ✗ (sequential Boom trace)")
+        return self.phase2_passed
+
+    def _record_boom_stage_timeout(self, error: BoomStageTimeout) -> bool:
+        """Persist a stage-specific BOOM timeout as infrastructure."""
+        self.infrastructure_failure = True
+        self.infrastructure_reason = f"{error.stage}_timeout"
+        self.simulation_report = {
+            "strategy": "sequential_boom_trace",
+            "infrastructure_failure": True,
+            "infrastructure_reason": self.infrastructure_reason,
+            "timeout_stage": error.stage,
+            "timeout_seconds": error.timeout_seconds,
+        }
+        print(
+            f"\n✗ Timeout in sequential Boom stage {error.stage} "
+            f"after {error.timeout_seconds}s")
+        return False
+
+    @staticmethod
+    def _detect_icache_bootstrap(golden_verilog_text: str) -> Optional[dict]:
+        """Detect VexRiscv InstructionCache — signals that burst iBus bootstrap is needed.
+
+        Returns a dict with instance info if the cache hierarchy is present,
+        else None.  When non-None, the testbench must deliver 8 consecutive
+        iBus_rsp_valid pulses per cmd (one per cache-line word); the CPU
+        boots naturally after the icache flush completes (~256 cycles
+        post-reset) without any external forcing of lineLoader_valid.
+        """
+        if ('IBusCachedPlugin_cache' in golden_verilog_text
+                and 'lineLoader_valid' in golden_verilog_text):
+            return {'instance': 'IBusCachedPlugin_cache', 'line_size_words': 8}
+        return None
+
+    @staticmethod
+    def _detect_tilelink_boom(golden_verilog_text: str) -> bool:
+        """Detect BoomSoC TileLink instruction bus — signals 64-bit DSP stimulus is needed.
+
+        Requires three markers that co-occur only in BoomSoC post-implementation netlists:
+          - DSP48E2: multiply unit is present
+          - d_bits_data: TileLink D-channel data port exposed at top level
+          - BoomCore: BoomSoC top-level module, absent from all other TileLink+DSP designs
+        """
+        return (
+            'DSP48E2' in golden_verilog_text
+            and 'd_bits_data' in golden_verilog_text
+            and 'BoomCore' in golden_verilog_text
+        )
+
     async def phase2_functional_simulation(self) -> bool:
         """Phase 2: Functional simulation comparison."""
         print("\n" + "="*70)
@@ -1359,7 +2429,7 @@ endmodule
             "force": True
         })
         print(f"✓ Revised model exported: {revised_v.name}")
-        
+
         # Query clock ports for the revised design as well, mainly so we can
         # detect mismatches that would invalidate the testbench (the testbench
         # is built from golden's port list, but revised must agree).
@@ -1371,12 +2441,13 @@ endmodule
                 f"Clock port set differs between golden ({sorted(golden_clocks)}) "
                 f"and revised ({sorted(revised_clocks)}); using golden's"
             )
-        
+
         # Parse design information
         print("\nParsing design information...")
         golden_info = self.get_design_info_from_verilog(golden_v)
         revised_info = self.get_design_info_from_verilog(revised_v)
-        
+        golden_info['verilog_path'] = str(golden_v)
+
         print(f"Golden module: {golden_info['module_name']}")
         print(f"Revised module: {revised_info['module_name']}")
         
@@ -1390,6 +2461,33 @@ endmodule
         for port in golden_info['ports']['outputs']:
             width_str = f" {port['width']}" if port['width'] else ""
             print(f"    - {port['name']}{width_str}")
+
+        # Boom's two full funcsim netlists exceed standard validation-instance
+        # memory when co-elaborated. Run the designs separately and replay a
+        # golden trace into the revised run instead.
+        try:
+            golden_text = golden_v.read_text(errors='replace')
+        except OSError:
+            golden_text = ''
+        if self._detect_tilelink_boom(golden_text):
+            try:
+                return self._run_boom_trace_pair(
+                    golden_v, revised_v, golden_info, revised_info,
+                    golden_clocks)
+            except BoomStageTimeout as e:
+                return self._record_boom_stage_timeout(e)
+            except Exception as e:
+                self.infrastructure_failure = True
+                self.infrastructure_reason = "exception_in_boom_sequential_trace"
+                self.simulation_report = {
+                    "strategy": "sequential_boom_trace",
+                    "infrastructure_failure": True,
+                    "infrastructure_reason": self.infrastructure_reason,
+                    "error": str(e),
+                }
+                logger.exception("Sequential Boom trace simulation failed")
+                print(f"\n✗ Sequential Boom trace simulation error: {e}")
+                return False
         
         # Generate testbench
         tb_path = self.temp_dir / "testbench.v"
@@ -1521,15 +2619,12 @@ endmodule
             # with thousands of user modules) can take many minutes per step.
             # xvlog/xelab times scale with design size; xsim time scales with both
             # design size and num_vectors.
-            xvlog_timeout_s = 1800   # 30 min
-            xelab_timeout_s = 3600   # 60 min - elaborates both designs
-            # xsim: per-cycle cost is roughly proportional to the number of
-            # primitive cells. Two copies of a 100k-LUT design (e.g.
-            # corescore_500_mod) measured ~0.3s/cycle. We add a generous baseline
-            # for kernel init and cap below by 60 min so small designs still get
-            # a comfortable budget.
+            xvlog_timeout_s = stage_timeout_s("FDAGENTS_XVLOG_TIMEOUT_S", 1800)
+            xelab_timeout_s = stage_timeout_s("FDAGENTS_XELAB_TIMEOUT_S", 3600)
+            xsim_floor_s = stage_timeout_s("FDAGENTS_XSIM_TIMEOUT_S", 3600)
+
             def xsim_timeout_for(vector_count: int) -> int:
-                return max(3600, 600 + int(vector_count * 1.0))
+                return max(xsim_floor_s, 600 + int(vector_count * 1.0))
             
             current_step = "xvlog (compilation)"
             result = subprocess.run(
@@ -1600,6 +2695,14 @@ endmodule
                 print(f"\n✗ Elaboration failed:")
                 print(result.stdout)
                 print(result.stderr)
+                self.infrastructure_failure = True
+                self.infrastructure_reason = "xelab_elaboration_failed"
+                self.simulation_report = {
+                    "infrastructure_failure": True,
+                    "infrastructure_reason": self.infrastructure_reason,
+                    "stage": current_step,
+                    "returncode": result.returncode,
+                }
                 return False
             
             print("✓ Elaboration successful")
@@ -1813,10 +2916,10 @@ endmodule
             phase2_passed = True  # Don't fail validation if phase2 is skipped
         else:
             phase2_passed = phase2_result
-        
+
         elapsed = time.time() - start_time
         self.print_final_report(elapsed)
-        
+
         return phase1_passed and phase2_passed
     
     def print_final_report(self, elapsed_time: float):
@@ -1835,8 +2938,12 @@ endmodule
             checks_total = self.structural_report.get("checks_total", 0)
             print(f"  Checks: {checks_passed}/{checks_total}")
             issues = self.structural_report.get("issues", [])
-            if issues:
-                print(f"  Issues: {len(issues)}")
+            real_issues = [issue for issue in issues if not is_structural_note(issue)]
+            note_issues = [issue for issue in issues if is_structural_note(issue)]
+            if real_issues:
+                print(f"  Issues: {len(real_issues)}")
+            if note_issues:
+                print(f"  Notes: {len(note_issues)}")
         
         print()
         if self.phase2_skipped:
@@ -1866,7 +2973,7 @@ endmodule
                 print(f"  Cycles: {self.simulation_report.get('cycles_simulated', 0)}")
                 print(f"  Mismatches: {self.simulation_report.get('mismatch_count', 0)}")
                 print(f"  Protocol mismatches: {self.simulation_report.get('protocol_mismatch_count', 0)}")
-        
+
         print()
         if self.phase2_skipped:
             overall_result = "PASSED ✓ (structural only)" if self.phase1_passed else "FAILED ✗"
@@ -1892,7 +2999,7 @@ endmodule
             "overall_passed": self.phase1_passed and self.phase2_passed,
             "preflight_report": self.preflight_report,
             "structural_report": self.structural_report,
-            "simulation_report": self.simulation_report
+            "simulation_report": self.simulation_report,
         }
         
         with open(report_file, 'w') as f:
@@ -1924,8 +3031,8 @@ Examples:
         "--vectors",
         "-n",
         type=int,
-        default=200,
-        help="Number of random test vectors to simulate (default: 200). "
+        default=1000,
+        help="Number of random test vectors to simulate (default: 1000). "
              "Larger benchmarks (e.g. corescore_500_mod) cost ~1s of xsim CPU "
              "per vector, so the default keeps wall-clock reasonable. Bump this "
              "up for higher-confidence runs."

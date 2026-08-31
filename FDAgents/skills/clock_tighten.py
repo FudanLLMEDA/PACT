@@ -12,11 +12,14 @@ from __future__ import annotations
 import logging
 import math
 import re
+import time
 from pathlib import Path
 from typing import Iterable, Optional
 
 from .base import (
+    SkillOutput,
     SkillResult,
+    candidate_budget_exhausted,
     calculate_fmax,
     parse_route_status_static,
     parse_timing_summary_static,
@@ -30,29 +33,96 @@ DEFAULT_FACTORS = [0.92, 0.88, 0.84]
 # it is not capped by the VU3P datasheet/global-clock 775 MHz number.
 DEFAULT_MAX_FABRIC_FMAX_MHZ = 0.0
 _MCP_RUN_TCL_TIMEOUT_GRACE_S = 120.0
+# Below this a place-and-route cannot reach a checkpoint, so starting one
+# only converts remaining window into a timeout.
+_MIN_RECIPE_TIMEOUT_S = 240.0
+
+# A full unplace-and-replace recipe measured 2284.1s on boom_soc at 226,568
+# LUTs and did not finish inside 2104s on boom_soc_v2 at 229,627.  Scale that
+# one completed measurement by LUT count to decide whether the granted window
+# can hold a full re-place at all; when it cannot, the cheaper route-only
+# recipe returns a candidate instead of being cut off with nothing.
+_FULL_REPLACE_MEASURED_S = 2284.1
+_FULL_REPLACE_MEASURED_LUTS = 226568
+
+
+def full_replace_fits_window(window_s: float, design_lut_count: object) -> bool:
+    """Return whether a full re-place plausibly completes inside the window."""
+    try:
+        luts = int(design_lut_count)
+    except (TypeError, ValueError):
+        return True
+    if luts <= 0 or window_s <= 0.0:
+        return True
+    expected_s = _FULL_REPLACE_MEASURED_S * luts / _FULL_REPLACE_MEASURED_LUTS
+    return float(window_s) >= expected_s
+
+# Every recorded one-hour flow this skill is meant to reproduce is the same
+# stage sequence over two choices: which placement directive, and which
+# router.  None of them routes with NoTimingRelaxation -- boom_soc and
+# boom_soc_v2 use AlternateCLBRouting, and vtr_mcml_v2, fir and corescore use
+# AggressiveExplore, with vtr's record noting that its ExtraTimingOpt contrast
+# rows regressed against Default placement.  Build the table from those two
+# axes instead of hardcoding one corner of it.
+_PLACE_DIRECTIVES = {
+    "extra_timing": "ExtraTimingOpt",
+    "extra_net": "ExtraNetDelay_high",
+    "default_place": None,
+}
+_ROUTE_DIRECTIVES = {
+    "no_relax": "NoTimingRelaxation",
+    "alternate_clb": "AlternateCLBRouting",
+    "aggr_explore": "AggressiveExplore",
+}
+
+
+def build_full_replace_command(place_key: str, route_key: str) -> str:
+    """Render one full re-place, stage for stage as the records run it."""
+    place = _PLACE_DIRECTIVES[place_key]
+    stages = [
+        "route_design -unroute",
+        "place_design -unplace",
+        "catch {opt_design -directive Explore}",
+        "place_design" + (f" -directive {place}" if place else ""),
+        # The dynamic bounded replication boom_soc's 96.909 row runs between
+        # placement and the fanout pass.  The nets come from the seed at run
+        # time -- the widest signal nets this design actually has -- so the
+        # stage carries no benchmark identity, and it is bounded to 32.
+        "set fda_wide [get_nets -quiet -hierarchical -filter "
+        "{TYPE == SIGNAL && FLAT_PIN_COUNT > 100}]",
+        "if {[llength $fda_wide] > 0} { catch {phys_opt_design "
+        "-force_replication_on_nets [lrange $fda_wide 0 31]} }",
+        "catch {phys_opt_design -directive AggressiveFanoutOpt}",
+        "phys_opt_design -directive AggressiveExplore",
+        f"route_design -directive {_ROUTE_DIRECTIVES[route_key]} -tns_cleanup",
+        "catch {phys_opt_design -critical_pin_opt}",
+        "phys_opt_design -directive AggressiveExplore",
+    ]
+    return "; ".join(stages)
+
 
 _RECIPE_COMMANDS = {
-    "extra_timing_no_relax": (
-        "route_design -unroute; "
-        "place_design -unplace; "
-        "place_design -directive ExtraTimingOpt; "
-        "phys_opt_design -directive Explore; "
-        "route_design -directive NoTimingRelaxation -tns_cleanup; "
-        "phys_opt_design -directive Explore"
-    ),
-    "extra_net_no_relax": (
-        "route_design -unroute; "
-        "place_design -unplace; "
-        "place_design -directive ExtraNetDelay_high; "
-        "phys_opt_design -directive Explore; "
-        "route_design -directive NoTimingRelaxation -tns_cleanup; "
-        "phys_opt_design -directive Explore"
-    ),
-    "route_only": (
-        "route_design -unroute; "
-        "route_design -directive NoTimingRelaxation -tns_cleanup; "
-        "phys_opt_design -directive Explore"
-    ),
+    f"{place_key}_{route_key}": build_full_replace_command(place_key, route_key)
+    for place_key in _PLACE_DIRECTIVES
+    for route_key in _ROUTE_DIRECTIVES
+}
+_RECIPE_COMMANDS["route_only"] = (
+    "route_design -unroute; "
+    "route_design -directive NoTimingRelaxation -tns_cleanup; "
+    "catch {phys_opt_design -critical_pin_opt}; "
+    "phys_opt_design -directive AggressiveExplore"
+)
+
+# A full re-place is the expensive half.  When the window cannot hold the
+# strict router, keep the re-place and swap the router that returns for the
+# one that iterates until the window ends.
+_FULL_REPLACE_RECIPES = frozenset(
+    name for name in _RECIPE_COMMANDS if name != "route_only"
+)
+_WINDOW_CONSTRAINED_SUBSTITUTE = {
+    name: f"{name.rsplit('_', 2)[0]}_alternate_clb"
+    for name in _RECIPE_COMMANDS
+    if name.endswith("_no_relax")
 }
 
 _RECIPE_ALIASES = {
@@ -311,28 +381,39 @@ def _normalize_factors(raw) -> list[float]:
 
 def _normalize_recipes(raw) -> list[dict[str, str]]:
     if raw is None:
-        raw_items = ["extra_timing_no_relax"]
+        # No recorded one-hour flow routes with NoTimingRelaxation.  boom_soc
+        # and boom_soc_v2 use AlternateCLBRouting, and it is also the only
+        # head-to-head this campaign has measured: on boom_soc at target
+        # 14.760 the strict router returned 71.4 MHz in 1,095s and this one
+        # 73.2 MHz in about 1,160s.
+        raw_items = ["extra_timing_alternate_clb"]
+    elif isinstance(raw, dict):
+        raw_items = [raw]
     elif isinstance(raw, str):
         raw_items = [item.strip() for item in raw.split(",")]
     else:
         raw_items = list(raw)
 
     recipes: list[dict[str, str]] = []
-    for idx, item in enumerate(raw_items, 1):
+    for item in raw_items:
         if not item:
             continue
         if isinstance(item, dict):
+            raw_name = str(item.get("name") or "").strip()
             command = str(item.get("command") or "").strip()
-            if not command:
-                continue
-            name = _safe_name(str(item.get("name") or f"custom_{idx}"))
+            if not raw_name or not command:
+                raise ValueError("custom recipes require nonempty name and command")
+            name = _safe_name(raw_name)
             recipes.append({"name": name, "command": command})
             continue
         name = str(item).strip()
         canonical = _RECIPE_ALIASES.get(name, name)
         command = _RECIPE_COMMANDS.get(canonical)
         if command is None:
-            recipes.append({"name": _safe_name(name), "command": name})
+            raise ValueError(
+                f"unknown clock_tighten recipe {name!r}; custom Tcl requires "
+                "a recipe object with name and command"
+            )
         else:
             recipes.append({"name": canonical, "command": command})
     return recipes
@@ -472,6 +553,39 @@ def _exception_looks_like_timeout(exc: Exception) -> bool:
     return isinstance(exc, TimeoutError) or "timeout" in str(exc).lower()
 
 
+def _clock_candidate_label(attempt: dict) -> str:
+    label = (
+        f"clock_tighten recipe={attempt['name']} "
+        f"period={float(attempt['target_period_ns']):.3f}ns"
+    )
+    if attempt.get("recap_period_ns") is not None:
+        label += f" recap={float(attempt['recap_period_ns']):.3f}ns"
+    elif attempt.get("clock_as_data_false_path"):
+        label += " variant=clock_as_data_false_path"
+    elif attempt.get("timeout_recovered"):
+        label += " variant=timeout_recovered"
+    return label[:120]
+
+
+def _clock_attempt_feedback(attempt: dict, runtime_s: float) -> dict:
+    return {
+        "label": _clock_candidate_label(attempt),
+        "status": (
+            "legal" if attempt.get("is_legal") else
+            "error" if "error" in attempt else "illegal"
+        ),
+        "local_metrics": {
+            "tightened_wns": attempt.get("tightened_wns_ns"),
+            "equivalent_wns": attempt.get("equivalent_wns_ns"),
+            "candidate_fmax_mhz": attempt.get("candidate_fmax_mhz"),
+            "scored_fmax_mhz": attempt.get("scored_fmax_mhz"),
+            "route_legal": attempt.get("route_legal"),
+            "timing_legal": attempt.get("timing_legal"),
+        },
+        "runtime_s": runtime_s,
+    }
+
+
 class ClockTightenSkill:
     """Sweep tightened clock periods with a bounded fresh place/route recipe."""
 
@@ -492,7 +606,17 @@ class ClockTightenSkill:
         original_clock = clock_period
 
         if original_clock is None:
-            return SkillResult.failure(before_wns, "missing original clock period", output_dcp)
+            return SkillResult.failure(
+                before_wns,
+                "missing original clock period",
+                output_dcp,
+                details={
+                    "attempts": [],
+                    "candidates": [],
+                    "budget_stopped": False,
+                    "unstarted": [],
+                },
+            )
 
         recipes = _normalize_recipes(params.get("recipes"))
         try:
@@ -523,7 +647,22 @@ class ClockTightenSkill:
             "fastest_first",
         }:
             periods = sorted(periods)
-        recipe_timeout = float(params.get("recipe_timeout_s", 1800.0))
+        # Every source of recipe_timeout_s is a static default -- config.yaml
+        # and the capability fallbacks -- so it states no per-action intent and
+        # must not cap the window the scheduler actually granted.  It is the
+        # fallback for the case where no deadline reached the skill.
+        recipe_timeout = float(params.get("recipe_timeout_s") or 1800.0)
+        try:
+            execution_deadline = params.get("_execution_deadline_monotonic")
+            execution_deadline = (
+                None if execution_deadline is None else float(execution_deadline)
+            )
+        except (TypeError, ValueError):
+            execution_deadline = None
+        try:
+            commit_reserve_s = float(params.get("_candidate_commit_reserve_s") or 0.0)
+        except (TypeError, ValueError):
+            commit_reserve_s = 0.0
         clock_name = str(
             params.get("clock_name")
             or getattr(mcp, "target_clock", "")
@@ -553,12 +692,45 @@ class ClockTightenSkill:
             max_recap_candidates = 1
 
         if not recipes:
-            return SkillResult.failure(before_wns, "no clock_tighten recipes selected", output_dcp)
+            return SkillResult.failure(
+                before_wns,
+                "no clock_tighten recipes selected",
+                output_dcp,
+                details={
+                    "attempts": [],
+                    "candidates": [],
+                    "budget_stopped": False,
+                    "unstarted": [],
+                },
+            )
         if not periods:
-            return SkillResult.failure(before_wns, "no valid clock_tighten target periods", output_dcp)
+            return SkillResult.failure(
+                before_wns,
+                "no valid clock_tighten target periods",
+                output_dcp,
+                details={
+                    "attempts": [],
+                    "candidates": [],
+                    "budget_stopped": False,
+                    "unstarted": [],
+                },
+            )
 
         attempts = []
+        feedback_attempts: list[dict] = []
+        candidate_feedback: list[dict] = []
+        candidate_outputs: list[SkillOutput] = []
         best_seen: Optional[dict] = None
+        budget_stopped = False
+        window_stopped = False
+        requested_labels = [
+            (
+                f"clock_tighten recipe={recipe['name']} "
+                f"period={target_period:.3f}ns"
+            )[:120]
+            for recipe in recipes
+            for target_period in periods
+        ]
         before_fmax = score_candidate_fmax(
             calculate_fmax(before_wns, original_clock),
             max_fmax_mhz=max_fmax_mhz,
@@ -572,18 +744,109 @@ class ClockTightenSkill:
         )
 
         stop_sweep = False
+        candidate_ordinal = 0
+        # What a rung of this sweep has actually cost on this design, which is
+        # a better floor for "can the next one finish" than a constant.
+        measured_attempt_cost_s = 0.0
         try:
             for recipe in recipes:
-                for target_period in periods:
+                # The factor ladder is anchored to the seed's achieved period,
+                # which the first rung supersedes as soon as it closes.  Keep
+                # the ladder's own step but re-base it on what this design has
+                # just proved it can close, so the sweep is not choosing
+                # between fixed pressure regimes that the score cannot tell
+                # apart: boom_soc measured 73.22 MHz from the aggressive
+                # ladder and 63.63 from the balanced one on an identical menu,
+                # while on boom_soc_v2 the aggressive ladder closed nothing at
+                # all and the balanced one reached 95.50.
+                ladder_step = (
+                    periods[1] / periods[0]
+                    if len(periods) >= 2 and periods[0] > 0 else None
+                )
+                ladder = list(periods)
+                measured_next: Optional[float] = None
+                while ladder or measured_next is not None:
+                    if measured_next is not None:
+                        target_period = measured_next
+                        measured_next = None
+                    else:
+                        target_period = ladder.pop(0)
+                    if candidate_budget_exhausted(
+                        params, completed_attempts=len(feedback_attempts)
+                    ):
+                        budget_stopped = True
+                        stop_sweep = True
+                        break
+                    candidate_ordinal += 1
                     name = str(recipe["name"])
                     candidate_dcp = run_dir / (
-                        f"clock_tighten_{_safe_name(name)}_{target_period:.3f}ns.dcp"
+                        f"clock_tighten_{candidate_ordinal:02d}_"
+                        f"{_safe_name(name)[:40]}_{target_period:.3f}ns.dcp"
                     )
                     attempt = {
                         "name": name,
                         "target_period_ns": target_period,
                         "output_dcp": str(candidate_dcp),
                     }
+                    # The scheduler already reserved this window for the
+                    # action.  A tool timeout shorter than the window kills a
+                    # place-and-route that was still inside its budget and
+                    # returns no candidate for the time already spent.
+                    attempt_timeout = recipe_timeout
+                    if execution_deadline is not None:
+                        window_s = (
+                            execution_deadline
+                            - time.monotonic()
+                            - commit_reserve_s
+                            - _MCP_RUN_TCL_TIMEOUT_GRACE_S
+                        )
+                        attempt_timeout = window_s
+                    # A rung this design has already measured is the honest
+                    # floor, and a tighter target costs more than a looser one,
+                    # never less.  boom_soc closed 16.751ns in 1320s and then
+                    # started 14.760ns with 1200s left: the attempt was cut off
+                    # with no candidate, and the round ended at 64.70 MHz where
+                    # the same rung had returned 73.22 when it was given the
+                    # time.  Losing the window is what costs the 8.5 MHz -- held
+                    # back, it is still there for the next round to spend.
+                    required_s = max(_MIN_RECIPE_TIMEOUT_S, measured_attempt_cost_s)
+                    if attempt_timeout < required_s:
+                        logger.info(
+                            "[clock_tighten] %s target=%.3f skipped: "
+                            "execution window %.0fs is below %.0fs",
+                            name, target_period, attempt_timeout, required_s,
+                        )
+                        window_stopped = True
+                        stop_sweep = True
+                        break
+                    # A full re-place that cannot finish inside the window is
+                    # cut off with no candidate at all, which is how
+                    # boom_soc_v2 spent two rounds.  Keep the re-place and
+                    # substitute the router that returns rather than the one
+                    # that iterates until the window ends.
+                    recipe_command = str(recipe["command"])
+                    # Only a recipe that routes strictly has a cheaper router to
+                    # fall back to.  Every full-replace name used to end in
+                    # `_no_relax`, so indexing this map by name was total; once
+                    # the table covered both routers it was not, and the
+                    # default recipe raised KeyError mid-sweep -- discarding
+                    # boom_soc's already-legal 16.751ns candidate.
+                    substitute = _WINDOW_CONSTRAINED_SUBSTITUTE.get(name)
+                    if (
+                        substitute is not None
+                        and not full_replace_fits_window(
+                            attempt_timeout, params.get("_design_lut_count")
+                        )
+                    ):
+                        recipe_command = _RECIPE_COMMANDS[substitute]
+                        attempt["recipe_substituted"] = substitute
+                        logger.info(
+                            "[clock_tighten] %s target=%.3f: %.0fs window cannot "
+                            "hold a full re-place at this design scale, using %s",
+                            name, target_period, attempt_timeout, substitute,
+                        )
+                    attempt["recipe_timeout_s"] = round(attempt_timeout, 3)
+                    started = time.monotonic()
                     try:
                         await mcp.call_vivado(
                             "open_checkpoint",
@@ -593,15 +856,15 @@ class ClockTightenSkill:
                         tcl = build_clock_tighten_tcl(
                             target_period,
                             clock_name,
-                            str(recipe["command"]),
+                            recipe_command,
                             checkpoint_path=str(candidate_dcp.resolve()),
                         )
                         recovered_from_timeout = False
                         try:
                             tcl_output = await mcp.call_vivado(
                                 "run_tcl",
-                                {"command": tcl, "timeout": recipe_timeout},
-                                timeout=recipe_timeout + _MCP_RUN_TCL_TIMEOUT_GRACE_S,
+                                {"command": tcl, "timeout": attempt_timeout},
+                                timeout=attempt_timeout + _MCP_RUN_TCL_TIMEOUT_GRACE_S,
                             )
                         except Exception as exc:
                             if (
@@ -743,7 +1006,8 @@ class ClockTightenSkill:
                                 recap_attempts.append(recap_attempt)
                                 if recap_is_legal:
                                     candidate_dcp = run_dir / (
-                                        f"clock_tighten_{_safe_name(name)}_"
+                                        f"clock_tighten_{candidate_ordinal:02d}_"
+                                        f"{_safe_name(name)[:40]}_"
                                         f"{target_period:.3f}ns_recap_{recap_period:.3f}ns.dcp"
                                     )
                                     scored_equiv_wns = equivalent_wns_for_scored_fmax(
@@ -836,7 +1100,8 @@ class ClockTightenSkill:
                             attempt["clock_as_data_false_path_attempt"] = false_path_attempt
                             if false_path_is_legal:
                                 candidate_dcp = run_dir / (
-                                    f"clock_tighten_{_safe_name(name)}_"
+                                    f"clock_tighten_{candidate_ordinal:02d}_"
+                                    f"{_safe_name(name)[:40]}_"
                                     f"{target_period:.3f}ns_clock_as_data_false_path.dcp"
                                 )
                                 scored_equiv_wns = equivalent_wns_for_scored_fmax(
@@ -901,19 +1166,94 @@ class ClockTightenSkill:
                             exc,
                         )
                     attempts.append(attempt)
+                    attempt_cost_s = time.monotonic() - started
+                    measured_attempt_cost_s = max(
+                        measured_attempt_cost_s, attempt_cost_s
+                    )
+                    feedback = _clock_attempt_feedback(attempt, attempt_cost_s)
+                    feedback_attempts.append(feedback)
+                    if attempt.get("is_legal"):
+                        candidate_outputs.append(
+                            SkillOutput(Path(attempt["output_dcp"]), feedback["label"])
+                        )
+                        candidate_feedback.append(feedback)
+                        # Drop the rungs this attempt has already beaten --
+                        # re-measuring known ground buys nothing -- and keep
+                        # the rest of the configured ladder as it is.  Only
+                        # when every remaining rung is beaten does the sweep
+                        # synthesise one, stepping down from what was achieved.
+                        #
+                        # Re-basing unconditionally overshot: boom_soc closed
+                        # 16.751ns with 1.222ns to spare, and stepping again
+                        # from that gave 13.683ns -- an 18% tightening where
+                        # the configured next rung was 12%.  13.683 timed out
+                        # after 1,260s and the round kept 64.4 MHz, against
+                        # the 73.2 that 14.760 had returned.
+                        achieved = achievable_period_ns(
+                            target_period, attempt.get("tightened_wns_ns")
+                        )
+                        if achieved is not None:
+                            ladder = [item for item in ladder if item < achieved]
+                            if not ladder and ladder_step is not None:
+                                nxt = round(achieved * ladder_step, 3)
+                                if PERIOD_PRECISION_NS < nxt < target_period:
+                                    measured_next = nxt
+                    # A rung that missed its own target cannot be answered by a
+                    # tighter one.  vtr_mcml_v2 missed 11.654ns by 1.941ns and
+                    # then spent about 1,150s of a 3,000s run timing out on
+                    # 10.269ns, which is the budget its second round needed.
+                    missed_by = attempt.get("tightened_wns_ns")
+                    if (
+                        not isinstance(missed_by, bool)
+                        and isinstance(missed_by, (int, float))
+                        and float(missed_by) < 0.0
+                    ):
+                        logger.info(
+                            "[clock_tighten] %s target=%.3f missed by %.3fns; "
+                            "a tighter target cannot close, keeping %d candidate(s)",
+                            name, target_period, -float(missed_by),
+                            len(candidate_outputs),
+                        )
+                        measured_next = None
+                        ladder = []
                     if stop_sweep:
                         break
                 if stop_sweep:
                     break
         except Exception as exc:
             logger.error("[clock_tighten] failed during sweep: %s", exc)
-            return SkillResult.failure(before_wns, str(exc), output_dcp)
+            return SkillResult.failure(
+                before_wns,
+                str(exc),
+                output_dcp,
+                details={
+                    "attempts": feedback_attempts,
+                    "candidates": candidate_feedback,
+                    "budget_stopped": budget_stopped,
+                    "window_stopped": window_stopped,
+                    "unstarted": requested_labels[len(feedback_attempts) :],
+                },
+            )
         try:
             if best_seen is None:
-                return SkillResult.failure(
-                    before_wns,
-                    f"no legal clock_tighten candidates; attempts={attempts}",
-                    output_dcp,
+                error = "no legal clock_tighten candidates"
+                return SkillResult(
+                    success=False,
+                    before_wns=before_wns,
+                    after_wns=before_wns,
+                    delta_wns=0.0,
+                    is_legal=False,
+                    output_dcp=output_dcp,
+                    summary=f"FAILED: {error}",
+                    error_msg=error,
+                    details={
+                        "attempts": feedback_attempts,
+                        "candidates": candidate_feedback,
+                        "budget_stopped": budget_stopped,
+                        "window_stopped": window_stopped,
+                    "window_stopped": window_stopped,
+                        "unstarted": requested_labels[len(feedback_attempts) :],
+                    },
                 )
 
             output_dcp = Path(best_seen["output_dcp"])
@@ -954,6 +1294,22 @@ class ClockTightenSkill:
                     f"clock_tighten:{best_seen['name']} {target_part} "
                     f"equivWNS {before_wns:.3f}->{after_wns:.3f}"
                 )
+            if budget_stopped:
+                summary += (
+                    f" budget_stop {len(feedback_attempts)}/{len(requested_labels)}"
+                )
+            if window_stopped:
+                summary += (
+                    f" window_stop {len(feedback_attempts)}/{len(requested_labels)}"
+                )
+            best_label = _clock_candidate_label(best_seen)
+            best_feedback = next(
+                (
+                    item for item in candidate_feedback
+                    if item["label"] == best_label
+                ),
+                _clock_attempt_feedback(best_seen, 0.0),
+            )
             return SkillResult(
                 success=True,
                 before_wns=before_wns,
@@ -963,11 +1319,30 @@ class ClockTightenSkill:
                 output_dcp=output_dcp,
                 summary=summary,
                 details={
-                    "attempts": attempts,
-                    "best": best_seen,
-                    "reopen_error": reopen_error,
+                    "attempts": feedback_attempts,
+                    "candidates": candidate_feedback,
+                    "best": {
+                        **best_feedback,
+                        "scored_fmax_mhz": best_seen.get("scored_fmax_mhz"),
+                    },
+                    "budget_stopped": budget_stopped,
+                    "window_stopped": window_stopped,
+                    "unstarted": requested_labels[len(feedback_attempts) :],
+                    "reopen_status": "failed" if reopen_error else "ok",
                 },
+                candidates=tuple(candidate_outputs),
             )
         except Exception as exc:
             logger.error("[clock_tighten] failed: %s", exc)
-            return SkillResult.failure(before_wns, str(exc), output_dcp)
+            return SkillResult.failure(
+                before_wns,
+                str(exc),
+                output_dcp,
+                details={
+                    "attempts": feedback_attempts,
+                    "candidates": candidate_feedback,
+                    "budget_stopped": budget_stopped,
+                    "window_stopped": window_stopped,
+                    "unstarted": requested_labels[len(feedback_attempts) :],
+                },
+            )

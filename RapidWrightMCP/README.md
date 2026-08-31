@@ -22,10 +22,10 @@ This server enables AI assistants like Cursor to interact with FPGA designs, que
 
 ### Installation
 
-The recommended setup uses the repository Makefile, which builds RapidWright from a git submodule:
+The recommended setup uses the contest repo's Makefile, which builds RapidWright from a git submodule:
 
 ```bash
-cd pact-artifact
+cd PACT
 make setup
 ```
 
@@ -45,7 +45,6 @@ make build-rapidwright
 ```bash
 cd RapidWrightMCP
 ./setup.sh
-python3 test_server.py
 ```
 
 ## Usage with Cursor
@@ -82,6 +81,9 @@ Restart Cursor after saving.
 | `search_cells` | Search for cells by name or type |
 | `get_tile_info` | Get information about a specific tile |
 | `search_sites` | Search for sites by type on a device |
+| `analyze_route_connections` | Read-only sink-specific PIP, detour, intent, trunk, fixed-route, and safety-certificate analysis from inline pins/pairs |
+| `find_proven_equivalent_sources` | Read-only exact FF/LUT source-equivalence certificates from inline critical-path pins |
+| `selective_unroute_sink_branches` | Certificate-gated removal of at most four proven-private sink branches; never whole-net unroutes |
 | `optimize_lut_input_cone` | Optimize LUT chains by combining into single LUTs |
 | `optimize_fanout` | Split high fanout nets by replicating drivers |
 
@@ -112,6 +114,44 @@ AI: [calls optimize_fanout]
 - **Be specific** with device names (e.g., "xcvu9p" not "vu9p")
 - **Chain requests**: "Load design X and tell me Y"
 - Use natural language - no need for exact tool names
+
+### Connection-level route safety
+
+`analyze_route_connections` uses the vendored 2025.2.1 APIs
+`DesignTools.getConnectionPIPs(SitePinInst)` and `PIP.isPIPFixed()`. It
+reconstructs every sink path and proves a private branch by route-tree set
+difference. It intentionally does not call `getTrimmablePIPsFromPins()` during
+analysis because that vendored helper can alter dual-driver/intra-site state.
+It reports geometric PIP endpoint lengths only; delay is
+always `unknown` and RapidWright approximate timing is not an acceptance gate.
+
+`selective_unroute_sink_branches` accepts only the exact `mutation_target`
+objects returned by that analysis and calls
+`DesignTools.unroutePins(Net, Collection)`. It refuses clocks, static nets,
+fixed PIPs, route gaps/islands, ambiguous sinks, and any branch whose removable
+PIPs overlap a preserved sink path. It never falls back to `Net.unroute()`.
+
+### Equivalent-source proof and remap
+
+`find_proven_equivalent_sources` uses vendored EDIF hierarchy APIs
+`EDIFNetlist.getParentNet()`, `EDIFHierNet.getLeafHierPortInsts()`, and
+`EDIFCellInst.getProperty()`. It proves only identical initialized FF transition
+relations for FDRE/FDSE/FDCE/FDPE (including `_1` forms), or exhaustive LUT1..LUT6 truth-table
+equivalence under one unique input-pin permutation. Canonical upstream net
+identity and inversion must match. Missing pins, multiple drivers, black boxes,
+routethrus, ambiguous permutations, and all other primitives are rejected.
+
+The internal `rewire_sink_to_proven_source` action is deliberately absent from
+the MCP tool list. It accepts only a complete certificate bound to the loaded
+DCP SHA256 and server session epoch, then recomputes the proof. The vendored
+mutation basis is `ECOTools.disconnectNet(Design, List<EDIFHierPortInst>)`,
+`ECOTools.connectNet(Design, Map<EDIFHierNet,List<EDIFHierPortInst>>, Map)`, and
+`DesignTools.unroutePins(Net, Collection<SitePinInst>)`. Because ECOTools
+documents an unfolded-netlist precondition, mutation additionally traverses the
+complete hierarchy and requires every non-primitive EDIF cell definition to be
+single-instantiated. Failure reloads the exact seed and blocks checkpoint writes
+until an explicit reload. This local ECO proof does not replace central Vivado
+measurement or final strict functional simulation/submission validation.
 
 ## Common Cell & Site Types
 
@@ -234,7 +274,6 @@ RapidWrightMCP/
 ├── rapidwright_tools.py   # RapidWright wrapper functions
 ├── requirements.txt       # Python dependencies (mcp + rapidwright pip bridge)
 ├── setup.sh              # Setup script
-├── test_server.py        # Test suite
 └── rapidwright_mcp.log   # Log file (created at runtime)
 
 ../RapidWright/            # Git submodule (Xilinx/RapidWright source)
@@ -279,10 +318,10 @@ To add a new tool:
        result = rw.my_new_tool(arguments["param1"])
    ```
 
-### Running Tests
+### Running Checks
 
 ```bash
-python3 test_server.py
+make check
 tail -f rapidwright_mcp.log
 ```
 
