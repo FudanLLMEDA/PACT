@@ -1,0 +1,36 @@
+example,split,dcp_relpath,orig_fmax_csv_mhz,luts,ffs,dsps,brams
+AMD Mini-ISP,train,benchmarks/amd_mini-isp_2025.1.dcp,307.1,3000,4000,40,12
+BOOM SoC,train,benchmarks/boom_soc_2025.1.dcp,48.2,227000,98000,61,161
+CoreScore-500,train,benchmarks/corescore_500_mod_2025.1.dcp,344.2,100000,120000,0,250
+FINN RadioML,train,benchmarks/finn_radioml_2025.1.dcp,284.9,74000,46000,0,25
+ISPD16 Example2,train,benchmarks/ispd16_example2_2025.1.dcp,107.6,289000,234000,200,384
+LogicNets JSCL,train,benchmarks/logicnets_jscl_2025.1.dcp,403.6,31000,2000,0,0
+Rosetta 3D Rendering,train,benchmarks/rosetta_3d-rendering_2025.1.dcp,270.9,14000,5000,3,0
+Rosetta Digit Recognition,train,benchmarks/rosetta_digit-recognition_2025.1.dcp,367.0,23000,23000,0,161
+Rosetta Optical Flow,train,benchmarks/rosetta_optical-flow_2025.1.dcp,324.9,34000,37000,42,61
+Rosetta Spam Filter,train,benchmarks/rosetta_spam-filter_2025.1.dcp,437.4,5000,13000,224,3
+VexRiscv Re-place,train,benchmarks/vexriscv_re-place_2025.1.dcp,310.2,2000,1000,4,6
+VTR MCML,train,benchmarks/vtr_mcml_2025.1.dcp,62.2,43000,15000,105,142
+FSA Systolic Array,train,benchmarks/self-added/fsa_systolic_array_01_routed.dcp,82.8,373800,29200,256,0
+Corundum AXIS Fabric,test,benchmarks/self-added/generated/corundum_axis_fabric_01_routed.dcp,179.1,76500,68200,0,144
+Corundum AXIS Fabric-Hard,test,benchmarks/self-added/generated/corundum_axis_fabric_hard_01_routed.dcp,140.0,229800,204600,0,432
+FPL26 Self-built,train,benchmarks/self-added/generated/fpl26_selfbuilt_01_routed_cleanio.dcp,235.0,10700,7900,144,24
+NVDLA Multi-array Basic,train,benchmarks/self-added/generated/nvdla_mularray_basic_01_routed.dcp,189.9,30200,722,0,0
+NVDLA Multi-array Large,test,benchmarks/self-added/generated/nvdla_mularray_large_01_routed.dcp,158.1,241500,30600,0,0
+NVDLA Multi-array XL,train,benchmarks/self-added/generated/nvdla_mularray_xl_01_routed.dcp,152.5,272600,33700,0,0
+Vortex Xbar Basic,train,benchmarks/self-added/generated/vortex_xbar_basic_01_routed.dcp,210.5,41400,27300,0,0
+Vortex Xbar Large,test,benchmarks/self-added/generated/vortex_xbar_large_01_routed.dcp,146.8,215500,156900,0,0
+AES,train,benchmarks/self-added/extracted/ref_project_dcp_suite/original/aes_active_original.dcp,334.0,3400,3000,0,0
+Double-Clock FFT-L,train,benchmarks/self-added/extracted/ref_project_dcp_suite/original/dblclockfft_fft_l_original.dcp,442.5,10800,26200,0,32
+Double-Clock FFT-M,train,benchmarks/self-added/extracted/ref_project_dcp_suite/original/dblclockfft_fft_m_original.dcp,456.4,5400,13100,0,16
+Double-Clock FFT-S,train,benchmarks/self-added/extracted/ref_project_dcp_suite/original/dblclockfft_fft_s_original.dcp,477.1,1400,3300,0,4
+OpenRISC 1200,test,benchmarks/self-added/extracted/ref_project_dcp_suite/original/or1200_active_original.dcp,209.0,4600,2500,4,4
+RaygenTop,train,benchmarks/self-added/extracted/ref_project_dcp_suite/original/raygentop_active_original.dcp,451.3,986,1700,9,0
+TCAM,train,benchmarks/self-added/extracted/ref_project_dcp_suite/original/tcam_active_original.dcp,561.8,156,281,0,0
+Verilog CORDIC-L,train,benchmarks/self-added/extracted/ref_project_dcp_suite/original/verilog_cordic_core_cordic_l_original.dcp,456.6,23400,23900,0,0
+Verilog CORDIC-M,train,benchmarks/self-added/extracted/ref_project_dcp_suite/original/verilog_cordic_core_cordic_m_original.dcp,473.7,11700,12000,0,0
+Verilog CORDIC-S,train,benchmarks/self-added/extracted/ref_project_dcp_suite/original/verilog_cordic_core_cordic_s_original.dcp,682.1,750,823,0,0
+Stress Congestion XL,test,benchmarks/self-added/extracted/stress_original/stress_congestion_xl_original.dcp,305.2,84600,104100,48,64
+Stress FFT-CORDIC-L,test,benchmarks/self-added/extracted/stress_original/stress_fft_cordic_l_original.dcp,338.4,60700,77400,32,48
+Stress FFT-CORDIC-M,train,benchmarks/self-added/extracted/stress_original/stress_fft_cordic_m_original.dcp,343.9,30900,39100,16,24
+Stress SoC-L,test,benchmarks/self-added/extracted/stress_original/stress_soc_l_original.dcp,326.9,43700,52800,32,32

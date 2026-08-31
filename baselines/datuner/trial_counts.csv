@@ -1,0 +1,36 @@
+design,datuner_num_ok,datuner_num_fail,datuner_total_trials,datuner_budget
+BOOM SoC,8,0,8,8
+CoreScore-500,12,0,12,12
+FINN RadioML,12,0,12,12
+ISPD16 Example2,,,,8
+Corundum AXIS Fabric,5,3,8,8
+Corundum AXIS Fabric-Hard,5,3,8,8
+FSA Systolic Array,,,,8
+NVDLA Multi-array Large,6,2,8,8
+NVDLA Multi-array XL,5,3,8,8
+Stress Congestion XL,12,0,12,12
+Stress FFT-CORDIC-L,12,0,12,12
+Vortex Xbar Large,1,1,2,8
+AMD Mini-ISP,15,0,15,15
+LogicNets JSCL,12,0,12,12
+Rosetta 3D Rendering,12,0,12,12
+Rosetta Digit Recognition,11,1,12,12
+Rosetta Optical Flow,12,0,12,12
+Rosetta Spam Filter,12,0,12,12
+VexRiscv Re-place,15,0,15,15
+VTR MCML,12,0,12,12
+AES,12,0,12,12
+Double-Clock FFT-L,15,0,15,15
+Double-Clock FFT-M,15,0,15,15
+Double-Clock FFT-S,15,0,15,15
+FPL26 Self-built,12,3,15,15
+NVDLA Multi-array Basic,14,1,15,15
+OpenRISC 1200,12,0,12,12
+RaygenTop,15,0,15,15
+Stress FFT-CORDIC-M,12,0,12,12
+Stress SoC-L,12,0,12,12
+TCAM,15,0,15,15
+Verilog CORDIC-L,15,0,15,15
+Verilog CORDIC-M,1,14,15,15
+Verilog CORDIC-S,15,0,15,15
+Vortex Xbar Basic,9,3,12,12

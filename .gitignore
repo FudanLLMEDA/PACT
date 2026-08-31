@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.dcp
+!benchmarks/**/*.dcp
+!benchmarks/*.dcp
+*.edf
+*.log
+*.jou
+.env
+.mcp.json
+.Xil/
+runs/
+results*.csv
+*.backup.jou
