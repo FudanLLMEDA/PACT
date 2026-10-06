@@ -259,7 +259,7 @@ def parse_timing_summary(rpt_path="timing_summary.rpt"):
     return wns, period, _u("CLB LUTs"), _u("CLB Registers"), _u("Block RAM Tile"), _u("DSPs")
 
 
-def run_vivado(dcp_path, cfg, target_period_ns, baseline, work_dir, timeout_s=1800,
+def run_vivado(dcp_path, cfg, target_period_ns, baseline, work_dir, timeout_s=3600,
                route_only=False, no_clock_tighten=False):
     """Run one Vivado eval. Returns (wns, metadata) or (None, error)."""
     work_dir = Path(work_dir)
@@ -322,7 +322,7 @@ def run_vivado(dcp_path, cfg, target_period_ns, baseline, work_dir, timeout_s=18
     return wns, res
 
 
-def run_datuner_local(dcp_path, budget, output_dir, timeout_s=1800,
+def run_datuner_local(dcp_path, budget, output_dir, timeout_s=3600,
                       no_clock_tighten=False, route_only=False):
     """Main bandit search loop."""
     output_dir = Path(output_dir)
@@ -459,7 +459,7 @@ def main():
     p.add_argument("--dcp", dest="dcp_path", required=True)
     p.add_argument("--budget", type=int, required=True)
     p.add_argument("--output-dir", dest="output_dir", required=True)
-    p.add_argument("--timeout", type=int, dest="timeout_s", default=1800)
+    p.add_argument("--timeout", type=int, dest="timeout_s", default=3600)
     p.add_argument("--no-clock-tighten", action="store_true", help="Skip clock tightening, use original period only")
     p.add_argument("--route-only", action="store_true", help="Skip unplace, only re-route (faster for large DCPs)")
     args = p.parse_args()

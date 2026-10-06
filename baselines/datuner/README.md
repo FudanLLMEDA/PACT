@@ -28,12 +28,12 @@ VIVADO_BIN=/path/to/vivado \
 python baselines/datuner/run_local.py \
   --dcp benchmarks/logicnets_jscl_2025.1.dcp \
   --budget 15 \
-  --timeout 1200 \
+  --timeout 3600 \
   --output-dir runs/datuner/logicnets
 ```
 
 The original experiment used the per-design 8-, 12-, or 15-trial budgets in
-`trial_counts.csv`. The per-trial timeout was 1,200 seconds. DATuner was not
+`trial_counts.csv`. The per-trial timeout was 3,600 seconds. DATuner was not
 subject to PACT's one-hour per-design wall-clock cap.
 
 ## Full benchmark batch

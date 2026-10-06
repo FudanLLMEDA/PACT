@@ -143,7 +143,7 @@ def main() -> int:
         "--output-dir", type=Path, default=REPO_ROOT / "runs" / "datuner"
     )
     parser.add_argument("--jobs", type=int, default=1)
-    parser.add_argument("--timeout", type=int, default=1200)
+    parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--only", action="append", default=[])
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

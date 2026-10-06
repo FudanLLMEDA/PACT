@@ -22,11 +22,11 @@ VIVADO_BIN=/path/to/vivado \
 python baselines/datuner/run_local.py \
   --dcp benchmarks/logicnets_jscl_2025.1.dcp \
   --budget 15 \
-  --timeout 1200 \
+  --timeout 3600 \
   --output-dir runs/datuner/logicnets
 ```
 
-原始实验针对不同设计使用 `trial_counts.csv` 中的 8、12 或 15 次 trial 预算，每次 trial 的超时为 1,200 秒。DATuner 不受 PACT 每个设计一小时 wall-clock 上限约束。
+原始实验针对不同设计使用 `trial_counts.csv` 中的 8、12 或 15 次 trial 预算，每次 trial 的超时为 3,600 秒。DATuner 不受 PACT 每个设计一小时 wall-clock 上限约束。
 
 ## 完整基准批处理
 
