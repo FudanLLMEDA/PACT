@@ -46,13 +46,14 @@ def _lookup_pricing(model: str) -> Optional[dict]:
     """
     Find pricing entry for a model.
 
-    1. Exact key match.
+    1. Exact key match; strip an optional 'openai/' gateway prefix.
     2. Prefix match (longest wins) — handles tagged variants like
        'claude-opus-4-6[1m]' or 'gpt-5.4-20260101'.
     3. None if nothing matches (caller decides how to react).
     """
     if model in PRICING:
         return PRICING[model]
+    model = model.removeprefix("openai/")
     matches = [(k, v) for k, v in PRICING.items() if model.startswith(k)]
     if matches:
         matches.sort(key=lambda kv: -len(kv[0]))
