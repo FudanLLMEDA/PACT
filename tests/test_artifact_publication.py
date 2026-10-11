@@ -77,3 +77,11 @@ def test_package_digest_streams_correct_content(tmp_path):
     path = tmp_path / 'input.dcp'
     path.write_bytes(b'original-checkpoint')
     assert PACKAGE.digest(path) == hashlib.sha256(b'original-checkpoint').hexdigest()
+
+
+def test_plain_text_completion_acknowledgement(monkeypatch):
+    import io
+    monkeypatch.setenv('FIGSHARE_TOKEN', 'test-only-not-a-real-token')
+    monkeypatch.setattr(PUBLISH.urllib.request, 'urlopen', lambda *a, **kw: io.BytesIO(b'202 Accepted'))
+    client = PUBLISH.Figshare()
+    assert client.request('POST', '/account/articles/10/files/8', json_response=False) == {}

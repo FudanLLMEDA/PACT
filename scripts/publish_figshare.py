@@ -26,7 +26,7 @@ class Figshare:
     def __init__(self):
         self.token = os.environ["FIGSHARE_TOKEN"]
 
-    def request(self, method, path, payload=None):
+    def request(self, method, path, payload=None, *, json_response=True):
         url = API + path if path.startswith("/") else path
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme != "https" or parsed.netloc != "api.figshare.com":
@@ -36,7 +36,7 @@ class Figshare:
             "Authorization": "token " + self.token, "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=120) as response:
             raw = response.read()
-        return json.loads(raw) if raw else {}
+        return json.loads(raw) if raw and json_response else {}
 
     def find_title(self, title):
         matches = []
@@ -98,7 +98,8 @@ class Figshare:
                             raise
                         time.sleep(2 ** attempt)
                 print(f"File {file_id}: uploaded part {index}/{len(parts)}", flush=True)
-        self.request("POST", f"{base}/{file_id}")
+        # Completion may return a successful plain-text/empty acknowledgement.
+        self.request("POST", f"{base}/{file_id}", json_response=False)
         for _ in range(30):
             entry = self.request("GET", f"{base}/{file_id}")
             if entry.get("computed_md5") == checksum:
@@ -159,7 +160,7 @@ def main():
         client.upload(article_id, checksum_path)
     article = client.request("GET", f"/account/articles/{article_id}")
     if args.publish and not article.get("is_public"):
-        client.request("POST", f"/account/articles/{article_id}/publish")
+        client.request("POST", f"/account/articles/{article_id}/publish", json_response=False)
     if args.publish:
         for attempt in range(12):
             try:
