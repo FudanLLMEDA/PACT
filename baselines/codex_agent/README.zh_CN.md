@@ -29,6 +29,56 @@
 
 论文使用模型 `gpt-5.5`、`xhigh` reasoning effort，并为每个设计设置一小时 wall-clock 上限。复现报告实验前，应在 Codex 配置中使用相同 reasoning effort。
 
+## 安装 Codex 与注册 MCP
+
+在 v1 artifact 根目录，先激活 Python 环境、构建 RapidWright 并加载 Vivado 环境：
+
+```bash
+npm install -g @openai/codex
+codex --version
+PACT_ROOT="$(pwd)"
+PACT_PYTHON="$(python -c 'import sys; print(sys.executable)')"
+export RAPIDWRIGHT_PATH="${RAPIDWRIGHT_PATH:-$PACT_ROOT/RapidWright}"
+export CLASSPATH="$RAPIDWRIGHT_PATH/bin:$RAPIDWRIGHT_PATH/jars/*"
+codex mcp add vivado -- \
+  "$PACT_PYTHON" "$PACT_ROOT/VivadoMCP/vivado_mcp_server.py" \
+  --vivado-path "$(command -v vivado)"
+codex mcp add rapidwright \
+  --env "RAPIDWRIGHT_PATH=$RAPIDWRIGHT_PATH" --env "CLASSPATH=$CLASSPATH" \
+  -- "$PACT_PYTHON" "$PACT_ROOT/RapidWrightMCP/server.py"
+codex mcp list
+```
+
+安装所选 CLI 版本支持的 Node.js/npm，并记录 CLI 版本。以上安装命令不锁定历史实验版本。
+MCP 名称必须为 `vivado` 和 `rapidwright`。已有同名配置时，先检查其路径再替换。
+注册成功不代表服务器能启动；还需运行根目录冒烟测试并检查 baseline 实跑日志。
+
+### AE Gateway 配置
+
+```bash
+export OPENAI_API_KEY="<your-evaluation-key>"
+export OPENAI_BASE_URL="https://ai-gateway.vercel.sh/v1"
+export CODEX_MODEL_PROVIDER="custom"
+export CODEX_WIRE_API="responses"
+```
+
+将下列配置合并到 `~/.codex/config.toml`，不要覆盖已有配置或重复表头。
+第一行放在所有 section 之前；`env_key` 填环境变量名，不是密钥：
+
+```toml
+model_reasoning_effort = "xhigh"
+
+[model_providers.custom]
+name = "Vercel AI Gateway"
+base_url = "https://ai-gateway.vercel.sh/v1"
+env_key = "OPENAI_API_KEY"
+wire_api = "responses"
+```
+
+使用该 Gateway 时，将下方运行命令改为 `--codex-model openai/gpt-5.5`。
+直连 OpenAI 则使用对应 provider 与 `gpt-5.5`，并取消上述 Gateway 环境变量。
+Harness 不自动读取根目录 `.env`，需显式导出变量。不要提交真实密钥。
+
 ## Dry run
 
 以下命令生成全部 35 个 prompt 和结果表，但不会启动 Codex 或 Vivado：
@@ -81,3 +131,5 @@ python baselines/codex_agent/summarize_results.py
 与论文一致，当方法没有超过未修改输入时，归一化 Fmax 按 1.0 计。预期几何平均提升为：27 个开发设计 +12.70%，8 个留出设计 +0.47%，全部 35 个设计 +9.78%。报告的平均运行时间为 1,524 秒，每个 DCP 平均 token 成本为 3.81 美元。
 
 原始双机启动器因嵌入实验主机路径和网络拓扑而有意排除。`run_codex_dcp_harness.py` 是可移植的执行核心，已经支持顺序或本地并行运行。
+
+注意：独立 baseline verifier 检查 route/timing，不执行功能仿真，也不证明形式等价。

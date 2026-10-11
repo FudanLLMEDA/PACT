@@ -178,6 +178,7 @@ class DCPValidator:
         precheck_vectors: int = 100,
         debug: bool = False,
         no_reactive: bool = False,
+        work_dir: Optional[Path] = None,
     ):
         self.golden_dcp = golden_dcp
         self.revised_dcp = revised_dcp
@@ -192,7 +193,8 @@ class DCPValidator:
         
         # Create temporary directory for intermediate files in workspace
         # (avoids /tmp running out of space for large designs)
-        workspace_dir = Path(__file__).parent
+        workspace_dir = work_dir or Path(__file__).parent
+        workspace_dir.mkdir(parents=True, exist_ok=True)
         self.temp_dir = Path(tempfile.mkdtemp(prefix="dcp_validation_", dir=workspace_dir))
         logger.info(f"Working directory: {self.temp_dir}")
         
@@ -1810,7 +1812,7 @@ endmodule
         if isinstance(phase2_result, dict) and phase2_result.get("status") == "skipped":
             self.phase2_skipped = True
             self.phase2_skip_reason = phase2_result.get("reason", "Unknown reason")
-            phase2_passed = True  # Don't fail validation if phase2 is skipped
+            phase2_passed = False  # A skipped simulation is not a functional pass
         else:
             phase2_passed = phase2_result
         
@@ -1869,7 +1871,7 @@ endmodule
         
         print()
         if self.phase2_skipped:
-            overall_result = "PASSED ✓ (structural only)" if self.phase1_passed else "FAILED ✗"
+            overall_result = "INCOMPLETE (simulation skipped)" if self.phase1_passed else "FAILED ✗"
         elif self.infrastructure_failure:
             overall_result = "INFRASTRUCTURE FAILURE ⊘"
         else:
@@ -1887,6 +1889,8 @@ endmodule
             "runtime_seconds": elapsed_time,
             "phase1_passed": self.phase1_passed,
             "phase2_passed": self.phase2_passed,
+            "phase2_skipped": self.phase2_skipped,
+            "phase2_skip_reason": self.phase2_skip_reason,
             "infrastructure_failure": self.infrastructure_failure,
             "infrastructure_reason": self.infrastructure_reason,
             "overall_passed": self.phase1_passed and self.phase2_passed,
@@ -1948,6 +1952,8 @@ Examples:
         help="Disable reactive stimulus generation (use pure LFSR randomness)"
     )
 
+    parser.add_argument("--work-dir", type=Path, help="Parent directory for preserved validation evidence")
+    parser.add_argument("--report-json", type=Path, help="Copy the detailed validation report to this path")
     args = parser.parse_args()
     
     # Validate inputs
@@ -1977,7 +1983,8 @@ Examples:
         num_vectors=args.vectors,
         precheck_vectors=args.precheck_vectors,
         debug=args.debug,
-        no_reactive=args.no_reactive
+        no_reactive=args.no_reactive,
+        work_dir=args.work_dir,
     )
     
     try:
@@ -1995,6 +2002,11 @@ Examples:
         logger.exception(f"Fatal error: {e}")
         sys.exit(1)
     finally:
+        if args.report_json is not None:
+            args.report_json.parent.mkdir(parents=True, exist_ok=True)
+            report = validator.temp_dir / "validation_report.json"
+            if report.exists():
+                args.report_json.write_text(report.read_text())
         await validator.cleanup()
 
 

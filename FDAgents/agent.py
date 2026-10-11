@@ -39,6 +39,9 @@ from .recipe_planner import load_default_knowledge_rows, plan_recipe
 from .skills import SKILLS, DEEP_ONLY_SKILLS
 from .skills.base import parse_timing_summary_static
 from .skills.force_replicate import _normalize_unroute_scope
+from .validation import capture_constraints, validate_checkpoint, check_functional
+from .results import sha256, write_summary
+from .memory import _calculate_fmax as _result_fmax
 
 logging.basicConfig(
     level=logging.INFO,
@@ -142,7 +145,7 @@ def _accepts_result(result, params: Optional[dict] = None) -> bool:
         min_delta = float(params.get("accept_min_delta_ns", ACCEPT_MIN_DELTA_NS))
     except (TypeError, ValueError):
         min_delta = ACCEPT_MIN_DELTA_NS
-    return bool(result.is_legal and result.delta_wns > min_delta)
+    return bool(result.success and result.is_legal and result.delta_wns > min_delta)
 
 
 def _is_blacklisted(
@@ -1694,7 +1697,11 @@ async def initial_analysis(mcp: MCPClient, input_dcp: Path) -> dict:
     # Baseline timing
     ts_report = await mcp.call_vivado("report_timing_summary", {}, timeout=300.0)
     ts = parse_timing_summary_static(ts_report)
-    baseline_wns = await mcp.get_wns() or ts.get("wns") or 0.0
+    baseline_wns = await mcp.get_wns()
+    if baseline_wns is None:
+        baseline_wns = ts.get("wns")
+    if baseline_wns is None or clock_period is None or clock_period <= 0:
+        raise RuntimeError("Input checkpoint is missing setup timing or a target clock")
 
     # min_fanout=20 keeps mid-fanout intermediate LUT outputs visible for
     # surgical per-net reroute; higher fanout nets feed broader replication.
@@ -1851,6 +1858,8 @@ async def run(
     force_llm_analysis: bool = False,
     replay_known_benchmark: bool = False,
     use_llm: bool = True,
+    skip_functional_check: bool = False,
+    validation_timeout: float = 1800.0,
 ) -> int:
     """
     Main entry point.  Returns 0 on success, non-zero on failure.
@@ -1863,22 +1872,40 @@ async def run(
     run_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Run directory: {run_dir}")
 
+    input_dcp = input_dcp.expanduser().resolve()
+    output_dcp = output_dcp.expanduser().resolve()
+    if input_dcp == output_dcp or output_dcp.exists():
+        raise ValueError("Output must be a new path, distinct from the input checkpoint")
+    if (run_dir / "summary.json").exists() or (run_dir / "current_best.dcp").exists():
+        raise ValueError("Use a fresh --run-dir for each experiment")
+    output_dcp.parent.mkdir(parents=True, exist_ok=True)
+    started = time.time()
+    summary = {
+        "schema_version": 1, "method": "pact", "status": "running",
+        "input_dcp": str(input_dcp), "output_dcp": None,
+        "requested_output_dcp": str(output_dcp), "run_dir": str(run_dir),
+        "model": model if use_llm else "rule-only", "time_limit_s": time_limit,
+        "validation_timeout_s": validation_timeout,
+        "skip_functional_check": skip_functional_check,
+        "force_llm_analysis": force_llm_analysis,
+        "replay_known_benchmark": replay_known_benchmark,
+        "token_budget_usd": TOKEN_BUDGET_USD,
+        "max_rounds": MAX_ROUNDS,
+        "baseline": {}, "final": {}, "trials": [],
+        "validation": {"functional": "not_checked", "formal_equivalence": "not_checked"},
+    }
+    write_summary(run_dir / "summary.json", summary)
     mcp = MCPClient(run_dir, debug=debug)
-    if use_llm:
-        llm = LLMClient(
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            skill_md_path=Path(__file__).parent / "SKILL.md",
-        )
-    else:
-        llm = RuleOnlyLLMStats()
+    llm = RuleOnlyLLMStats()
     memory_path = run_dir / "memory.json"
     current_best_dcp = run_dir / "current_best.dcp"
-
-    deadline = time.time() + time_limit
+    deadline = started + time_limit
 
     try:
+        summary["input_sha256"] = sha256(input_dcp)
+        if use_llm:
+            llm = LLMClient(model=model, api_key=api_key, base_url=base_url,
+                            skill_md_path=Path(__file__).parent / "SKILL.md")
         await mcp.start_servers()
 
         # ---------------------------------------------------------------
@@ -1890,6 +1917,11 @@ async def run(
         baseline_wns = analysis["baseline_wns"]
         clock_period = analysis["clock_period"]
         fanout_nets = analysis["fanout_nets"]
+        constraints = await capture_constraints(mcp, run_dir / "constraints")
+        summary["baseline"] = {"wns_ns": baseline_wns, "clock_period_ns": clock_period,
+                               "fmax_mhz": _result_fmax(baseline_wns, clock_period)}
+        summary["constraints"] = constraints
+        write_summary(run_dir / "summary.json", summary)
 
         # Copy input DCP as current_best baseline
         shutil.copy(input_dcp, current_best_dcp)
@@ -2231,7 +2263,25 @@ async def run(
                 mem.save(memory_path)
                 continue
 
+            validation = {"passed": False, "functional": "not_checked", "status": "not_attempted"}
+            if _accepts_result(result, params):
+                normalized = run_dir / f"validated_round_{round_num}.dcp"
+                validation = await validate_checkpoint(
+                    mcp, result.output_dcp, normalized, constraints,
+                    run_dir / "validation" / f"round_{round_num}",
+                )
+                result.is_legal = validation["passed"]
+                if validation["passed"]:
+                    result.output_dcp = normalized
+                    result.after_wns = validation["timing"]["wns"]
+                    result.delta_wns = result.after_wns - before_wns
             accepted = _accepts_result(result, params)
+            summary["trials"].append({
+                "round": round_num, "skill": skill_name, "target": str(target),
+                "before_wns_ns": before_wns, "after_wns_ns": result.after_wns,
+                "accepted": accepted, "validation": validation,
+            })
+            write_summary(run_dir / "summary.json", summary)
             mem.record(
                 skill=skill_name,
                 target=target,
@@ -2254,8 +2304,7 @@ async def run(
                 from .memory import _calculate_fmax
                 fmax = _calculate_fmax(result.after_wns, clock_period)
                 mem.update_best(result.after_wns, fmax, str(current_best_dcp))
-                # Copy to final output immediately (so partial results are saved)
-                shutil.copy(current_best_dcp, output_dcp)
+                # Recovery state stays in run_dir; publish only after final validation.
                 if _should_refresh_force_replicate_candidates(mem, skill_name):
                     try:
                         added_force = await _refresh_force_replicate_candidates(mcp, mem)
@@ -2320,12 +2369,39 @@ async def run(
         # ---------------------------------------------------------------
         # Step 5: Final output
         # ---------------------------------------------------------------
-        if current_best_dcp.exists():
-            shutil.copy(current_best_dcp, output_dcp)
+        final_candidate = run_dir / "final_candidate.dcp"
+        summary["optimization_wall_time_s"] = time.time() - started
+        validation = await validate_checkpoint(
+            mcp, current_best_dcp, final_candidate, constraints, run_dir / "validation" / "final",
+        )
+        summary["validation"] = validation
+        if not validation["passed"]:
+            summary["status"] = "validation_failed"
+            return 2
+        final_wns_checked = validation["timing"]["wns"]
+        summary["final"] = {"wns_ns": final_wns_checked, "clock_period_ns": clock_period,
+                            "fmax_mhz": _result_fmax(final_wns_checked, clock_period)}
+        # Free optimization backends before starting independent functional checks.
+        await mcp.cleanup()
+        if not skip_functional_check:
+            functional = await check_functional(input_dcp, final_candidate,
+                                                run_dir / "validation" / "final", validation_timeout)
+            validation["functional"] = functional["status"]
+            validation["functional_evidence"] = functional
+            write_summary(run_dir / "validation" / "final" / "validation.json", validation)
+            if functional["status"] != "passed":
+                summary["status"] = "validation_failed"
+                return 2
+        pending_output = output_dcp.with_suffix(output_dcp.suffix + ".tmp")
+        shutil.copy(final_candidate, pending_output)
+        pending_output.replace(output_dcp)
+        summary["output_dcp"] = str(output_dcp)
+        summary["output_sha256"] = sha256(output_dcp)
+        summary["status"] = "completed" if not skip_functional_check else "functional_not_checked"
 
         elapsed = time.time() - (deadline - time_limit)
-        final_wns = mem.current_best["wns"]
-        final_fmax = mem.current_best.get("fmax")
+        final_wns = summary["final"]["wns_ns"]
+        final_fmax = summary["final"]["fmax_mhz"]
 
         print("\n" + "=" * 60)
         print("FDAgents Optimization Summary")
@@ -2351,15 +2427,23 @@ async def run(
 
     except KeyboardInterrupt:
         logger.info("[agent] Interrupted")
-        if current_best_dcp.exists():
-            shutil.copy(current_best_dcp, output_dcp)
+        summary["status"] = "interrupted"
         return 130
     except Exception:
         logger.exception("[agent] Fatal error")
-        if current_best_dcp.exists():
-            shutil.copy(current_best_dcp, output_dcp)
+        summary["status"] = "failed"
         return 1
+    except asyncio.CancelledError:
+        summary["status"] = "interrupted"
+        raise
     finally:
+        summary["wall_time_s"] = time.time() - started
+        summary["usage"] = {
+            "llm_calls": llm.call_count, "input_tokens": llm.total_input_tokens,
+            "cached_input_tokens": getattr(llm, "total_cached_input_tokens", 0),
+            "output_tokens": llm.total_output_tokens, "cost_usd": llm.total_cost,
+        }
+        write_summary(run_dir / "summary.json", summary)
         await mcp.cleanup()
 
 
@@ -2396,6 +2480,10 @@ Examples:
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help="LLM model name")
     parser.add_argument("--time-limit", type=float, default=3600.0, help="Time limit in seconds")
+    parser.add_argument("--skip-functional-check", action="store_true",
+                        help="Export route/timing-checked output without a functional pass; excluded from validated aggregates")
+    parser.add_argument("--validation-timeout", type=float, default=1800.0,
+                        help="Final structural/simulation check timeout, separate from optimization budget")
     parser.add_argument("--debug", action="store_true", help="Debug mode (MCP logs to console)")
     parser.add_argument("--run-dir", type=Path, default=None, help="Explicit run directory")
     parser.add_argument(
@@ -2428,6 +2516,9 @@ Examples:
     )
     args = parser.parse_args()
 
+    if args.time_limit <= 0 or args.validation_timeout <= 0:
+        parser.error("time limits must be positive")
+
     # Validate input
     if not args.input_dcp.exists():
         print(f"Error: Input file not found: {args.input_dcp}", file=sys.stderr)
@@ -2454,6 +2545,8 @@ Examples:
         force_llm_analysis=args.force_llm_analysis,
         replay_known_benchmark=args.replay_known_benchmark,
         use_llm=not args.no_llm,
+        skip_functional_check=args.skip_functional_check,
+        validation_timeout=args.validation_timeout,
     ))
     sys.exit(rc)
 

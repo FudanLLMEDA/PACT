@@ -1,70 +1,144 @@
-# PACT FPT'26 论文 Artifact
+# PACT FPT'26 论文 Artifact — v1 维护线
 
 [English](README.md) | [简体中文](README.zh_CN.md)
 
-本仓库包含 PACT 布线后 FPGA 检查点优化智能体、智能体驱动的 Vivado 与 RapidWright MCP 服务器，以及优化知识库。35 个基准 DCP 通过 Git LFS 提供；专有 FPGA 工具不包含在仓库中。
+本目录对应 **FPT'26 论文 v1**，不是 main 上的 FPL'26 竞赛 v2。使用 AE 归档指定的
+v1 release。共有 35 个原始 DCP（27 个开发集、8 个留出集）；不包含 Vivado 及许可证。
 
-## 目录结构
+## 1. 获取与校验
 
-- `FDAgents/`：智能体、类型化技能、配方规划器、决策逻辑与记忆
-- `baselines/codex_agent/`：自由形式 Codex Agent 基线运行器和参考结果
-- `baselines/datuner/`：DATuner 检查点运行器和参考结果
-- `RapidWrightMCP/`、`VivadoMCP/`：后端 MCP 服务器
-- `knowledge/`：优化知识和实验记录
-- `benchmarks/`：35 个评测 DCP、清单与校验和
-- `journals/`：为 Artifact 准备保留的论文源码
-- `tests/`：不需要基准 DCP 的单元测试
-- `runs/`：生成的运行输出，已被 Git 忽略
-
-## 环境
-
-完整 Artifact 需要 Python 3、Vivado 2025.1、Java，以及已经构建的 RapidWright checkout。将 `.env.example` 复制为 `.env`，填写本地路径与 LLM 凭据。`.env` 和生成的 DCP 已被 Git 忽略。
-
-## 运行
+Git checkout 用户执行：
 
 ```bash
+git submodule update --init --recursive
+git lfs install
+git lfs pull
+(cd benchmarks && sha256sum -c SHA256SUMS)
+```
+
+完整 AE 归档也应执行校验。GitHub 自动生成的源码 ZIP 可能只有 LFS 指针，且不包含
+子模块，不等于完整 artifact。详见 [基准说明](benchmarks/README.zh_CN.md)。
+
+## 2. 安装
+
+需要 Linux、Python 3.10+、Vivado **2025.1** 及许可证、Java 11+ 和构建后的 RapidWright。
+在 artifact 根目录执行：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install -r requirements.txt
-python -m FDAgents.agent /path/to/design.dcp --model <model>
+source /path/to/Vivado/2025.1/settings64.sh
+export VIVADO_EXEC="$(command -v vivado)"
+make build-rapidwright
+export RAPIDWRIGHT_PATH="$PWD/RapidWright"
+export CLASSPATH="$RAPIDWRIGHT_PATH/bin:$RAPIDWRIGHT_PATH/jars/*"
+cp .env.example .env  # 仅首次执行，不要覆盖已有配置
 ```
 
-## 确定性功能冒烟测试
-
-两个不使用 LLM 的流程分别测试两个后端，适合作为初始 Artifact 检查。把以下竞赛检查点放到同一目录：
-
-- `vexriscv_re-place_2025.1.dcp`
-- `logicnets_jscl_2025.1.dcp`
-
-然后运行：
+填写 `.env` 中的本地路径和密钥，或导出环境变量。AE Gateway 示例（禁止提交真实密钥）：
 
 ```bash
-DCP_DIR=/path/to/checkpoints \
-OUT_ROOT="$PWD/reproduction-smoke" \
-PYTHON=/path/to/python \
-VIVADO_EXEC=/path/to/vivado \
-scripts/run_functional_smoke.sh
+export OPENAI_BASE_URL="https://ai-gateway.vercel.sh/v1"
+export OPENAI_API_KEY="<your-evaluation-key>"
+export FDAGENTS_MODEL="openai/gpt-5.5"
 ```
 
-传入 `vexriscv` 或 `logicnets` 可以只运行一个设计。当 MCP 后端返回应用级错误、VexRiscv 流程没有移动 cell、Vivado 报告布线错误、输出 DCP 缺失，或独立重开的检查点未通过 route signoff 时，命令会失败。日志、校验和、退出码、signoff timing report 与输出 DCP 会写入 `OUT_ROOT`。
+直连 OpenAI 时使用对应 endpoint 与 `gpt-5.5`。记录 `vivado -version`、`java -version`、
+`python -m pip freeze`；Codex baseline 还需记录 `codex --version`。
 
-无需 Vivado 的轻量门控回归：
+## 3. 无 LLM 冒烟测试
 
 ```bash
-python tests/test_smoke_checks.py
+DCP_DIR="$PWD/benchmarks" PYTHON="$(command -v python)" \
+  OUT_ROOT="$PWD/runs/smoke" scripts/run_functional_smoke.sh
 ```
 
-对输入和输出 DCP 进行结构及基于仿真的比较：
+测试 VexRiscv、LogicNets 的后端执行与 route replay。**这不是完整 timing/功能验证**；
+生成 timing report 不代表 hold、pulse-width 或等价检查通过。
+
+## 4. PACT 单设计与批处理
 
 ```bash
+python -m FDAgents.agent benchmarks/amd_mini-isp_2025.1.dcp \
+  --output runs/pact/mini-isp/output.dcp --run-dir runs/pact/mini-isp \
+  --model "$FDAGENTS_MODEL" --time-limit 3600
+python scripts/run_pact_batch.py --model "$FDAGENTS_MODEL" --dry-run
+python scripts/run_pact_batch.py --model "$FDAGENTS_MODEL" --run-root runs/pact-full
+```
+
+每次使用新的 run/output 路径。可重复传 `--design "AMD Mini-ISP"`、`--design "BOOM SoC"`
+选择子集，名称来自 `benchmarks/MANIFEST.csv`。单设计 `--no-llm` 是诊断模式，不等于论文
+LLM 实验；已知基准名称回放仍需显式启用。
+
+### 结果与验证边界
+
+- `summary.json`：版本化机器可读结果，包含输入 hash、配置、trial 决策、指标、验证状态、
+  耗时、token 和成本。增量写入，异常/中断时保留；强制杀进程可能留下 `running`，不能算完成。
+- `memory.json`：内部决策历史，不是稳定的汇总接口。
+- `constraints/`：原始 timing XDC 与时钟名称/周期/波形。
+- `validation/round_*/`、`validation/final/`：候选与最终输出的重开、route/timing、功能证据。
+- `current_best.dcp`、skill DCP、`final_candidate.dcp`：内部候选，不是已通过验证的输出。
+
+接受有提升的候选前，公共 gate 恢复输入 timing 约束（时钟及 timing exceptions），写出并重开
+DCP，检查完整布线、setup 测量、非负 hold/pulse-width，再以恢复后的 WNS 判断提升。
+Fmax 是 `1000 / (原始周期 - WNS)` 的 setup 推导值，不保证所有时钟域均能在该频率运行。
+允许负 setup slack，因为目标是提升存在 timing violation 的输入的 Fmax，不承诺原频率下闭合。
+
+最终导出重复上述 gate，并默认进行独立结构检查和 200 向量功能仿真（50 向量预检查）。
+仿真跳过、报告缺失、超时均不算通过。**这不是形式等价证明，也不在每个中间候选上运行仿真。**
+最终验证失败不写用户指定的输出路径；内部 DCP 留作诊断。显式 `--skip-functional-check`
+允许输出但标记为未做功能验证，汇总时排除。
+
+3,600 秒是优化预算；动作之间检查 deadline，运行中的工具可能超时完成，候选 gate 计入优化时间。
+最终 signoff 是额外工作；`--validation-timeout` 默认 1,800 秒，约束最终结构/仿真子进程，
+不包含独立的 Vivado report 调用。结果分别记录优化与总耗时。加强后的 gate 可能改变候选选择
+与运行时间，**没有因此重跑或重新认证历史论文数字**。见 [AE 修改说明](docs/AE_CHANGES.md)。
+
+## 5. 汇总本次 PACT 结果
+
+```bash
+python scripts/summarize_pact_results.py runs/pact-full --output-dir runs/pact-full-aggregate
+```
+
+输出逐设计 `results.csv` 和分组 `aggregate.json`。以 manifest 原始 Fmax 计算
+`max(1, final_Fmax / original_Fmax)` 的几何平均，同时输出有样本数标记的时间/成本均值；CSV 保留本次测量的 baseline。
+失败、缺失、未验证的运行列出但不计入均值；覆盖数量和 `complete` 显式标记是否完整。
+重复运行报错，不自动挑选最佳结果。这不是历史论文数据的重建。
+
+## 6. DATuner
+
+详见 [DATuner 文档](baselines/datuner/README.zh_CN.md)。按 `trial_counts.csv` 指定 trial
+数量，**每个 Vivado trial 超时 3,600 秒**，不是 1,200 秒，也不是 DATuner 整个设计仅一小时。
+
+```bash
+python baselines/datuner/run_batch.py --dry-run
+python baselines/datuner/run_batch.py --output-dir runs/datuner
+python baselines/datuner/summarize_results.py
+```
+
+最后一条汇总的是历史 reference CSV，不是上面新运行的结果。
+
+## 7. Codex Agent
+
+先完成 [安装、MCP 注册、凭据、模型与 reasoning 配置](baselines/codex_agent/README.zh_CN.md)，
+再按其中命令 dry-run、正式运行和独立验证。`codex mcp list` 有记录不等于服务器启动成功。
+使用与 PACT、DATuner 相同的输入及子集。
+
+## 8. 单元测试与独立功能比较
+
+```bash
+python -m pip install pytest
+python -m pytest -q tests
 python validate_dcps.py input.dcp output.dcp \
-  --precheck-vectors 50 --vectors 200
+  --precheck-vectors 50 --vectors 200 --report-json runs/comparison.json
 ```
 
-完整的 35 设计实验和基准获取流程将在 Artifact 提交前单独记录。
+单元测试不需要 Vivado，实际 DCP 验证需要。采样仿真不是形式等价认证。
 
-## 许可证
+## 许可证与版本
 
-由 FudanLLMEDA 贡献者编写的 PACT 代码采用 [MIT License](LICENSE)。保留 AMD 版权头和 `SPDX-License-Identifier: Apache-2.0` 标记的文件继续采用 [Apache License 2.0](LICENSE-APACHE-2.0.txt)，根目录 MIT 许可证不会重新许可这些文件。`RapidWright/` 子模块和其他第三方依赖遵循各自的上游许可证。Vivado 是专有软件，不包含在本仓库中。
-
-## 快照
-
-本 Artifact 分支起始于 2026-06-25 的实现快照。Git 历史在发布前被有意压缩并净化。为兼容已评测 DCP，必要位置仍保留历史基准文件名和 `clk_fpl26contest` 时钟标识。
+PACT 自有代码使用 [MIT](LICENSE)，保留 AMD Apache 标识的文件继续使用
+[Apache 2.0](LICENSE-APACHE-2.0.txt)。第三方依赖遵循各自许可证。
+v1 起始于净化后的 2026-06-25 实现快照，维护提交不重写已有 v1/v2 标签。
+历史文件名与 `clk_fpl26contest` 保留用于兼容。

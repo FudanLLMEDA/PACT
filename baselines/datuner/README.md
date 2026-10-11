@@ -36,6 +36,15 @@ The original experiment used the per-design 8-, 12-, or 15-trial budgets in
 `trial_counts.csv`. The per-trial timeout was 3,600 seconds. DATuner was not
 subject to PACT's one-hour per-design wall-clock cap.
 
+
+**Correction history:** v1.0.0 documented 1,200 s; v1.0.1 corrected the
+per-trial runner defaults and documentation to 3,600 s. If your archive still
+says 1,200 s, it is an older snapshot. `trial_counts.csv` specifies trial counts,
+not timeouts. The approximately 12-hour per-design allowance (and exploratory
+24-hour extensions for a few timeout cases) described in the AE discussion is
+distinct from a per-trial timeout; the batch runner does not impose that total
+wall-clock allowance. Historical reference results were not rerun by this fix.
+
 ## Full benchmark batch
 
 Preview the 35 commands without running Vivado:

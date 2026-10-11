@@ -12,3 +12,5 @@ __pycache__/
 runs/
 results*.csv
 *.backup.jou
+
+.venv/

@@ -28,6 +28,13 @@ python baselines/datuner/run_local.py \
 
 原始实验针对不同设计使用 `trial_counts.csv` 中的 8、12 或 15 次 trial 预算，每次 trial 的超时为 3,600 秒。DATuner 不受 PACT 每个设计一小时 wall-clock 上限约束。
 
+
+**勘误记录：** v1.0.0 文档曾写 1,200 秒；v1.0.1 已将每 trial 默认值和文档统一为
+3,600 秒。仍写 1,200 秒的归档是旧快照。`trial_counts.csv` 只指定 trial 数量，
+不包含 timeout。AE 讨论中提及的每设计约 12 小时，以及少数超时案例尝试延长到
+24 小时，是另外的整体运行安排；批处理脚本不自动施加该总时限。
+本次勘误没有重跑或修改历史参考结果。
+
 ## 完整基准批处理
 
 不启动 Vivado，仅预览 35 条命令：

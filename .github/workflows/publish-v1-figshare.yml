@@ -1,0 +1,48 @@
+name: Publish FPT v1 archive to Figshare
+
+on:
+  push:
+    branches: [release/1.0.3]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: figshare-fpt-v1.0.3
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      RELEASE_TAG: v1.0.3
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Download and verify the exact GitHub release archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'PACT-FPT2026-v1.0.3.zip*' --dir dist
+          cd dist
+          sha256sum -c PACT-FPT2026-v1.0.3.zip.sha256
+      - name: Upload, publish and verify a new Figshare record
+        env:
+          FIGSHARE_TOKEN: ${{ secrets.PACT_AE_FIGSHARE_UPLOAD_TOKEN }}
+        run: |
+          python3 scripts/publish_figshare.py \
+            --source-article 34046277 --version "$RELEASE_TAG" \
+            --archive dist/PACT-FPT2026-v1.0.3.zip \
+            --release-url "https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG" \
+            --output dist/figshare-publication.json --publish
+      - name: Preserve publication receipt (no credentials)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: figshare-v1.0.3-publication
+          path: dist/figshare-publication.json
+          if-no-files-found: warn
