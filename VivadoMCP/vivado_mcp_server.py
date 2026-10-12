@@ -27,9 +27,11 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 try:
+    from .tcl_transport import TclTransport, tcl_word
     from .timing_profile import build_timing_path_profile
     from .pblock_candidates import build_slice_pblock_candidates
 except ImportError:
+    from tcl_transport import TclTransport, tcl_word
     from timing_profile import build_timing_path_profile
     from pblock_candidates import build_slice_pblock_candidates
 
@@ -54,6 +56,7 @@ _vivado_log_file: Optional[str] = None
 _vivado_journal_file: Optional[str] = None
 _design_open: bool = False
 _command_pending: bool = False  # True if a command timed out and may still be running
+_tcl_transport: Optional[TclTransport] = None
 
 
 def get_vivado_path() -> str:
@@ -88,19 +91,26 @@ def build_vivado_spawn_command(vivado_path: str, args: list[str]) -> tuple[str, 
 
 def cleanup_vivado():
     """Kill Vivado process if running. Called on exit."""
-    global _vivado_process, _vivado_pid
-    if _vivado_pid:
+    global _vivado_process, _vivado_pid, _tcl_transport, _design_open, _command_pending
+    if _vivado_pid and _vivado_process is not None and _vivado_process.isalive():
         try:
-            os.kill(_vivado_pid, signal.SIGKILL)
+            # pexpect starts a dedicated session; terminate its loader and
+            # native Vivado children too, not just the wrapper script.
+            os.killpg(_vivado_pid, signal.SIGKILL)
         except (OSError, ProcessLookupError):
             pass
-        _vivado_pid = None
+    _vivado_pid = None
     if _vivado_process and _vivado_process.isalive():
         try:
             _vivado_process.terminate(force=True)
         except Exception:
             pass
-        _vivado_process = None
+    _vivado_process = None
+    if _tcl_transport is not None:
+        _tcl_transport.close()
+        _tcl_transport = None
+    _design_open = False
+    _command_pending = False
 
 
 def signal_handler(signum, frame):
@@ -122,12 +132,13 @@ def start_vivado(log_file: Optional[str] = None, journal_file: Optional[str] = N
         log_file: Path to Vivado log file (default: vivado.log in current directory)
         journal_file: Path to Vivado journal file (default: vivado.jou in current directory)
     """
-    global _vivado_process, _vivado_pid
+    global _vivado_process, _vivado_pid, _tcl_transport, _design_open, _command_pending
 
     if _vivado_process and _vivado_process.isalive():
         logger.info("Vivado process already running")
         return _vivado_process
 
+    cleanup_vivado()
     vivado_path = get_vivado_path()
     logger.info(f"Starting Vivado from: {vivado_path}")
     
@@ -173,6 +184,7 @@ def start_vivado(log_file: Optional[str] = None, journal_file: Optional[str] = N
     # Wait for Vivado prompt
     logger.info("Waiting for Vivado prompt...")
     _vivado_process.expect(VIVADO_PROMPT)
+    _tcl_transport = TclTransport(_vivado_process, VIVADO_PROMPT, notrace=True)
     logger.info("Vivado ready")
     
     return _vivado_process
@@ -192,79 +204,36 @@ def wait_for_prompt(proc: pexpect.spawn, timeout: float) -> str:
     return proc.before
 
 
+def _transport_for(proc):
+    global _tcl_transport
+    if _tcl_transport is None or _tcl_transport.process is not proc:
+        if _tcl_transport is not None:
+            _tcl_transport.close()
+        _tcl_transport = TclTransport(proc, VIVADO_PROMPT, notrace=True)
+    return _tcl_transport
+
+
 def sync_after_timeout(proc: pexpect.spawn) -> str:
-    """
-    After a timeout, wait for the previous command to complete.
-    Returns the output from the command that was running.
-    """
+    """Drain the exact pending command, not the first prompt in its output."""
     global _command_pending
-    if not _command_pending:
-        return ""
-    
-    # Wait indefinitely for the prompt (command to complete)
-    # Use a very long timeout (1 hour) as a safety
+    transport = _transport_for(proc)
     try:
-        output = wait_for_prompt(proc, timeout=3600)
-        _command_pending = False
-        return f"[Previous command completed]\n{output}"
-    except pexpect.TIMEOUT:
-        # Still stuck after 1 hour - Vivado is truly hung
-        _command_pending = True
-        raise RuntimeError("Vivado appears to be hung. Use restart_vivado to recover.")
+        output = transport.recover(timeout=3600)
+        return f"[Previous command completed]\n{output}" if output else ""
+    finally:
+        _command_pending = transport.pending is not None
 
 
 def run_tcl_command(command: str, timeout: Optional[float] = None) -> str:
-    """
-    Run a Tcl command in Vivado and return the output.
-    
-    Args:
-        command: Tcl command to execute
-        timeout: Timeout in seconds (None for default 300s)
-    
-    Returns:
-        Command output as string
-    """
+    """Run a complete script; preserve its response boundary across timeouts."""
     global _command_pending
-    
     proc = ensure_vivado()
-    
-    # If a previous command timed out, wait for it to complete first
-    if _command_pending:
-        sync_output = sync_after_timeout(proc)
-        if sync_output:
-            # Previous command completed, we can continue
-            pass
-    
-    # Use provided timeout or default
-    effective_timeout = timeout if timeout is not None else 300
-    
-    # Log the command (truncate if very long)
-    cmd_log = command if len(command) < 200 else command[:200] + "..."
-    logger.info(f"Executing Tcl command: {cmd_log}")
-    
-    # Send command
-    proc.sendline(command)
-    
+    transport = _transport_for(proc)
+    logger.info("Executing Tcl command: %s", command[:200])
     try:
-        # Wait for prompt and capture output
-        proc.expect(VIVADO_PROMPT, timeout=effective_timeout)
-        
-        # Get output (everything between command echo and prompt)
-        output = proc.before
-        
-        # Remove the echoed command from output (first line)
-        lines = output.split("\n")
-        if lines and command in lines[0]:
-            output = "\n".join(lines[1:])
-        
-        logger.info(f"Command completed successfully")
-        return output.strip()
-    
-    except pexpect.TIMEOUT:
-        # Mark that we have a pending command
-        _command_pending = True
-        logger.error(f"Command timed out after {effective_timeout}s: {cmd_log}")
-        raise
+        return transport.execute(command, timeout=timeout if timeout is not None else 300)
+    finally:
+        _command_pending = transport.pending is not None
 
 
 def restart_vivado_process() -> str:
@@ -278,13 +247,11 @@ def restart_vivado_process() -> str:
 
 
 def close_current_design() -> str:
-    """Close the current design if one is open."""
+    """Close actual checkpoint project state, including changes made by raw Tcl."""
     global _design_open
-    if _design_open:
-        output = run_tcl_command("close_design")
-        _design_open = False
-        return output
-    return "No design was open."
+    output = run_tcl_command("if {[llength [get_projects -quiet]]} {close_project}")
+    _design_open = False
+    return output
 
 
 def get_critical_high_fanout_nets(
@@ -1757,12 +1724,12 @@ async def call_tool(name: str, arguments: dict):
             dcp_path = arguments["dcp_path"]
             timeout = arguments.get("timeout", 300)
             
-            # Close existing design if open
-            if _design_open:
-                close_current_design()
-            
-            # Open the checkpoint
-            output = run_tcl_command(f"open_checkpoint {{{dcp_path}}}", timeout=timeout)
+            # Raw Tcl and timed-out tools can change project state without
+            # updating the Python flag. Query Vivado itself before reopening.
+            _design_open = False
+            output = run_tcl_command(
+                "if {[llength [get_projects -quiet]]} {close_project}; "
+                f"open_checkpoint {tcl_word(dcp_path)}", timeout=timeout)
             _design_open = True
             return [TextContent(type="text", text=f"Opened checkpoint: {dcp_path}\n\n{output}")]
         

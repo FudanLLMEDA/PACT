@@ -1,0 +1,12 @@
+{
+  "scope": "Local final-release unit tests and dry-runs, not the remote Vivado environment",
+  "python": "3.13.5",
+  "packages": {
+    "mcp": "1.30.0",
+    "openai": "3.28.0",
+    "pexpect": "4.9.0",
+    "pytest": "9.1.1",
+    "python-dotenv": "1.2.4"
+  },
+  "tests_passed": 90
+}

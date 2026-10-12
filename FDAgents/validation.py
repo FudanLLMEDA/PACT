@@ -62,6 +62,16 @@ def classify_reports(route_report: str, timing_report: str) -> dict:
         else:
             # Negative setup slack is expected for timing-closure inputs.
             checks[name] = "measured" if name == "setup" else "passed"
+        if name in ("hold", "pulse_width"):
+            count_key = "ths_failing_endpoints" if name == "hold" else "tpws_failing_endpoints"
+            failing = timing.get(count_key)
+            if failing is None:
+                checks[name] = "missing"
+            elif failing != 0:
+                # Rounded -0.000 slack must not hide a failing endpoint.
+                checks[name] = "failed"
+    if timing.get("min_period_slack_ns") is not None and timing["min_period_slack_ns"] < 0:
+        checks["pulse_width"] = "failed"
     return {"passed": all(v in ("passed", "measured") for v in checks.values()),
             "checks": checks, "timing": timing, "route": route,
             "functional": "not_checked", "formal_equivalence": "not_checked"}
@@ -101,14 +111,15 @@ async def validate_checkpoint(mcp, candidate: Path, normalized: Path,
 
 
 async def check_functional(input_dcp: Path, output_dcp: Path, directory: Path,
-                           timeout: float) -> dict:
+                           timeout: float, *, elaboration_timeout: float = 3600.0) -> dict:
     """Run the existing structural + simulation checker, never a formal proof."""
     directory.mkdir(parents=True, exist_ok=True)
     report = (directory / "functional.json").resolve()
     command = [sys.executable, str(Path(__file__).resolve().parents[1] / "validate_dcps.py"),
                str(input_dcp.resolve()), str(output_dcp.resolve()),
                "--precheck-vectors", "50", "--vectors", "200", "--report-json", str(report),
-               "--work-dir", str(directory.resolve())]
+               "--work-dir", str(directory.resolve()),
+               "--elaboration-timeout", str(elaboration_timeout)]
     with (directory / "functional.log").open("w") as log:
         proc = await asyncio.create_subprocess_exec(*command, stdout=log, stderr=log, start_new_session=True)
         try:
@@ -124,5 +135,6 @@ async def check_functional(input_dcp: Path, output_dcp: Path, directory: Path,
             return {"status": "timeout", "report": str(report)}
     data = json.loads(report.read_text()) if report.exists() else {}
     passed = rc == 0 and data.get("phase1_passed") is True and data.get("phase2_passed") is True and not data.get("phase2_skipped") and not data.get("infrastructure_failure")
-    return {"status": "passed" if passed else "failed", "exit_code": rc,
+    status = "passed" if passed else "infrastructure_failed" if data.get("infrastructure_failure") or rc == 2 else "failed"
+    return {"status": status, "exit_code": rc,
             "report": str(report), "formal_equivalence": "not_checked"}

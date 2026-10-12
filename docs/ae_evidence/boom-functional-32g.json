@@ -1,0 +1,45 @@
+{
+  "evidence_note": "Fields from the locally preserved remote verification report; runtime paths omitted.",
+  "golden_dcp": "original.dcp",
+  "revised_dcp": "normalized.dcp",
+  "num_vectors": 200,
+  "precheck_vectors": 50,
+  "runtime_seconds": 1902.6699011325836,
+  "phase1_passed": true,
+  "phase2_passed": false,
+  "phase2_skipped": false,
+  "phase2_skip_reason": null,
+  "infrastructure_failure": false,
+  "infrastructure_reason": null,
+  "overall_passed": false,
+  "preflight_report": {
+    "status": "not_needed",
+    "reason": "rapidwright_direct_compare_succeeded_or_non_readability_failure"
+  },
+  "structural_report": {
+    "status": "success",
+    "comparison_result": "PASS",
+    "checks_passed": 4,
+    "checks_total": 4,
+    "golden_design": {
+      "top_module": "ChipTop",
+      "device": "xcvu3p",
+      "cell_count": 376923,
+      "port_count": 43
+    },
+    "revised_design": {
+      "top_module": "ChipTop",
+      "device": "xcvu3p",
+      "cell_count": 377216,
+      "port_count": 43
+    },
+    "issues": [
+      "INFO: Cell count increased: 376923 -> 377216 (0.08% increase - likely due to optimization)"
+    ]
+  },
+  "simulation_report": null,
+  "postmortem": {
+    "classification": "infrastructure_oom",
+    "evidence": "xelab killed; Docker OOMKilled=true; cgroup oom_kill=1; peak and limit both 34359738368 bytes. Old infrastructure_failure=false is retained, not retroactively edited."
+  }
+}

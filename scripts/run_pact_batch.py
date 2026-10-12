@@ -3,6 +3,7 @@
 import argparse
 import csv
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -18,8 +19,13 @@ def main():
     p.add_argument("--model", required=True)
     p.add_argument("--time-limit", type=float, default=3600)
     p.add_argument("--validation-timeout", type=float, default=1800)
+    p.add_argument("--recipe-timeout-scale", type=float, default=1.0)
+    p.add_argument("--elaboration-timeout", type=float, default=3600)
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
+    if any(not math.isfinite(v) or v <= 0 for v in
+           (args.time_limit, args.validation_timeout, args.recipe_timeout_scale, args.elaboration_timeout)):
+        p.error("time limits and recipe timeout scale must be finite and positive")
     with args.manifest.open() as f:
         rows = list(csv.DictReader(f))
     names = {r["example"] for r in rows}
@@ -33,7 +39,9 @@ def main():
         run = args.run_root.resolve() / dcp.stem
         command = [sys.executable, "-m", "FDAgents.agent", str(dcp), "--output", str(run / "output.dcp"),
                    "--run-dir", str(run), "--model", args.model, "--time-limit", str(args.time_limit),
-                   "--validation-timeout", str(args.validation_timeout)]
+                   "--validation-timeout", str(args.validation_timeout),
+                   "--recipe-timeout-scale", str(args.recipe_timeout_scale),
+                   "--elaboration-timeout", str(args.elaboration_timeout)]
         print(json.dumps({"design": row["example"], "command": command}), flush=True)
         if not args.dry_run:
             if run.exists():

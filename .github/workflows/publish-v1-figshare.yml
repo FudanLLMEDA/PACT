@@ -2,14 +2,14 @@ name: Publish FPT v1 archive to Figshare
 
 on:
   push:
-    branches: [release/1.0.3]
+    branches: [release/1.0.4]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: figshare-fpt-v1.0.3
+  group: figshare-fpt-v1.0.4
   cancel-in-progress: false
 
 jobs:
@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
-      RELEASE_TAG: v1.0.3
+      RELEASE_TAG: v1.0.4
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -26,23 +26,56 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # The branch push starts this job before the release asset upload.
+          # Wait for both assets to be uploaded; never publish an incomplete ZIP.
+          ready=false
+          for attempt in $(seq 1 120); do
+            if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+              --jq '[.assets[] | select(.state == "uploaded") | .name] | contains(["PACT-FPT2026-v1.0.4.zip", "PACT-FPT2026-v1.0.4.zip.sha256"])' \
+              2>/dev/null | grep -qx true; then
+              ready=true
+              break
+            fi
+            sleep 15
+          done
+          test "$ready" = true
           gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --pattern 'PACT-FPT2026-v1.0.3.zip*' --dir dist
+            --pattern 'PACT-FPT2026-v1.0.4.zip*' --dir dist
           cd dist
-          sha256sum -c PACT-FPT2026-v1.0.3.zip.sha256
+          sha256sum -c PACT-FPT2026-v1.0.4.zip.sha256
       - name: Upload, publish and verify a new Figshare record
         env:
           FIGSHARE_TOKEN: ${{ secrets.PACT_AE_FIGSHARE_UPLOAD_TOKEN }}
         run: |
           python3 scripts/publish_figshare.py \
-            --source-article 34046277 --version "$RELEASE_TAG" \
-            --archive dist/PACT-FPT2026-v1.0.3.zip \
+            --source-article 34333314 --version "$RELEASE_TAG" \
+            --archive dist/PACT-FPT2026-v1.0.4.zip \
             --release-url "https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG" \
             --output dist/figshare-publication.json --publish
+      - name: Verify a fresh unauthenticated public download
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, urllib.request
+          from pathlib import Path
+          receipt_path = Path("dist/figshare-publication.json")
+          receipt = json.loads(receipt_path.read_text())
+          expected = Path("dist/PACT-FPT2026-v1.0.4.zip.sha256").read_text().split()[0]
+          digest = hashlib.sha256()
+          size = 0
+          with urllib.request.urlopen(receipt["archive"]["download_url"], timeout=180) as stream:
+              for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                  digest.update(chunk)
+                  size += len(chunk)
+          assert digest.hexdigest() == expected, "Public ZIP SHA-256 mismatch"
+          assert size == receipt["archive"]["size"], "Public ZIP length mismatch"
+          receipt["public_download_verification"] = {"sha256": expected, "bytes": size, "passed": True}
+          receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+          print("Unauthenticated Figshare ZIP download matches the exact release archive:", expected)
+          PY
       - name: Preserve publication receipt (no credentials)
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: figshare-v1.0.3-publication
+          name: figshare-v1.0.4-publication
           path: dist/figshare-publication.json
           if-no-files-found: warn

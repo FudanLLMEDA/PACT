@@ -1,0 +1,60 @@
+{
+  "evidence_note": "Selected fields from a saved direct SSH reading of summary.json; runtime paths omitted. No rerun implied.",
+  "captured_at": "2026-10-12T08:18:46.822Z",
+  "source_run": "pact-ae-full-stress-20261012",
+  "status": "completed",
+  "time_limit_s": 3600.0,
+  "validation_timeout_s": 1800.0,
+  "optimization_wall_time_s": 2499.151933193207,
+  "wall_time_s": 3877.2891869544983,
+  "baseline": {
+    "wns_ns": -0.908,
+    "clock_period_ns": 2.0,
+    "fmax_mhz": 343.879
+  },
+  "final": {
+    "wns_ns": -0.708,
+    "clock_period_ns": 2.0,
+    "fmax_mhz": 369.276
+  },
+  "validation": {
+    "passed": true,
+    "checks": {
+      "routing": "passed",
+      "setup": "measured",
+      "hold": "passed",
+      "pulse_width": "passed",
+      "checkpoint_reopen": "passed"
+    },
+    "timing": {
+      "wns": -0.708,
+      "tns": -924.128,
+      "failing_endpoints": 4001,
+      "total_endpoints": 86694,
+      "whs": 0.007,
+      "ths": 0.0,
+      "ths_failing_endpoints": 0,
+      "ths_total_endpoints": 86694,
+      "wpws": 0.3,
+      "tpws": 0.0,
+      "tpws_failing_endpoints": 0,
+      "tpws_total_endpoints": 46463,
+      "min_period_required_ns": 1.666,
+      "min_period_actual_ns": 2.0,
+      "min_period_slack_ns": 0.334
+    },
+    "route": {
+      "routable_nets": 48267,
+      "fully_routed_nets": 48267,
+      "nets_with_routing_errors": 0,
+      "routed_ok": true
+    },
+    "functional": "passed",
+    "formal_equivalence": "not_checked",
+    "functional_evidence": {
+      "status": "passed",
+      "exit_code": 0,
+      "formal_equivalence": "not_checked"
+    }
+  }
+}

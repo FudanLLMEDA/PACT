@@ -1,0 +1,16 @@
+{
+  "evidence_note": "Fields from the locally preserved remote verification report; runtime paths omitted.",
+  "status": "passed",
+  "memory_gib": 64,
+  "functional_timeout_s": 7200,
+  "xelab_timeout_s": 5400,
+  "scope": "independent post-budget functional verification of the previously timing-checked 89.654 MHz candidate",
+  "elapsed_s": 2429.5581772327423,
+  "functional": {
+    "status": "passed",
+    "exit_code": 0,
+    "formal_equivalence": "not_checked"
+  },
+  "oom_control_after": "oom_kill_disable 0\nunder_oom 0\noom_kill 1\n",
+  "normalized_dcp_sha256": "e14f34da747fdf259dc67722c07a7cd4f96ea6115b9ff894a30bf12144643a2b"
+}

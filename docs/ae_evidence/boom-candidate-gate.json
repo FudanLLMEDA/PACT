@@ -1,0 +1,54 @@
+{
+  "evidence_note": "Fields from the locally preserved remote verification report; runtime paths omitted.",
+  "status": "functional_failed",
+  "scope": "post-budget standalone candidate verification, not a one-hour optimization result",
+  "functional_timeout_s": 7200,
+  "inputs": {
+    "original.dcp": "f71f2a2f255dd6753329057d77465f9ca0b4888e0fed290aeefeb630b1fd5127",
+    "candidate.dcp": "aaf46c91e75101e0c3ea76357f4ef7bed9b3bc1dc76a5245d1c77218a188543c"
+  },
+  "elapsed_s": 2277.6420323848724,
+  "original_clock_ns": 1.569,
+  "gate": {
+    "passed": true,
+    "checks": {
+      "routing": "passed",
+      "setup": "measured",
+      "hold": "passed",
+      "pulse_width": "passed",
+      "checkpoint_reopen": "passed"
+    },
+    "timing": {
+      "wns": -9.585,
+      "tns": -953908.688,
+      "failing_endpoints": 218611,
+      "total_endpoints": 247398,
+      "whs": 0.01,
+      "ths": 0.0,
+      "ths_failing_endpoints": 0,
+      "ths_total_endpoints": 247398,
+      "wpws": 0.0,
+      "tpws": 0.0,
+      "tpws_failing_endpoints": 0,
+      "tpws_total_endpoints": 107685,
+      "min_period_required_ns": 1.569,
+      "min_period_actual_ns": 1.569,
+      "min_period_slack_ns": 0.0
+    },
+    "route": {
+      "routable_nets": 273660,
+      "fully_routed_nets": 273660,
+      "nets_with_routing_errors": 0,
+      "routed_ok": true
+    },
+    "functional": "not_checked",
+    "formal_equivalence": "not_checked"
+  },
+  "restored_clock_ns": 1.569,
+  "fmax_mhz": 89.65393580778196,
+  "functional": {
+    "status": "failed",
+    "exit_code": 1,
+    "formal_equivalence": "not_checked"
+  }
+}

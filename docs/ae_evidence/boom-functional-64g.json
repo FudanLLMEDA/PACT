@@ -1,0 +1,80 @@
+{
+  "evidence_note": "Fields from the locally preserved remote verification report; runtime paths omitted.",
+  "golden_dcp": "original.dcp",
+  "revised_dcp": "normalized.dcp",
+  "num_vectors": 200,
+  "precheck_vectors": 50,
+  "runtime_seconds": 2425.956287384033,
+  "phase1_passed": true,
+  "phase2_passed": true,
+  "phase2_skipped": false,
+  "phase2_skip_reason": null,
+  "infrastructure_failure": false,
+  "infrastructure_reason": null,
+  "overall_passed": true,
+  "preflight_report": {
+    "status": "not_needed",
+    "reason": "rapidwright_direct_compare_succeeded_or_non_readability_failure"
+  },
+  "structural_report": {
+    "status": "success",
+    "comparison_result": "PASS",
+    "checks_passed": 4,
+    "checks_total": 4,
+    "golden_design": {
+      "top_module": "ChipTop",
+      "device": "xcvu3p",
+      "cell_count": 376923,
+      "port_count": 43
+    },
+    "revised_design": {
+      "top_module": "ChipTop",
+      "device": "xcvu3p",
+      "cell_count": 377216,
+      "port_count": 43
+    },
+    "issues": [
+      "INFO: Cell count increased: 376923 -> 377216 (0.08% increase - likely due to optimization)"
+    ]
+  },
+  "simulation_report": {
+    "precheck_vectors": 50,
+    "precheck_passed": true,
+    "precheck_report": {
+      "vectors_requested": 50,
+      "cycles_simulated": 50,
+      "mismatch_count": 0,
+      "protocol_mismatch_count": 0,
+      "result_pass_seen": true,
+      "result_fail_seen": false,
+      "simulator_failed": false,
+      "infrastructure_failure": false,
+      "infrastructure_reason": null,
+      "returncode": 0,
+      "passed": true
+    },
+    "full_vectors": 200,
+    "full_report": {
+      "vectors_requested": 200,
+      "cycles_simulated": 200,
+      "mismatch_count": 0,
+      "protocol_mismatch_count": 0,
+      "result_pass_seen": true,
+      "result_fail_seen": false,
+      "simulator_failed": false,
+      "infrastructure_failure": false,
+      "infrastructure_reason": null,
+      "returncode": 0,
+      "passed": true
+    },
+    "cycles_simulated": 200,
+    "mismatch_count": 0,
+    "protocol_mismatch_count": 0,
+    "result_pass_seen": true,
+    "result_fail_seen": false,
+    "simulator_failed": false,
+    "infrastructure_failure": false,
+    "infrastructure_reason": null,
+    "returncode": 0
+  }
+}

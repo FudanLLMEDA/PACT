@@ -38,7 +38,7 @@ def _detect_tool_error(server: str, tool: str, response: str) -> None:
 
     Triggers on:
       - top-level JSON object with an "error" key
-      - line starting with "ERROR:" or "ERROR [" (Vivado convention)
+      - line starting with "Error:" (case-insensitive) or "ERROR [" (Vivado convention)
 
     Does NOT trigger on empty output — some tools legitimately return nothing.
     """
@@ -61,7 +61,7 @@ def _detect_tool_error(server: str, tool: str, response: str) -> None:
     # Vivado-style ERROR lines
     for line in response.splitlines():
         line = line.strip()
-        if line.startswith("ERROR:") or line.startswith("ERROR ["):
+        if line.lower().startswith("error:") or line.startswith("ERROR ["):
             raise MCPToolError(server, tool, line[:200], raw=response)
 
 
@@ -78,6 +78,7 @@ class MCPClient:
         self.vivado_session: Optional[ClientSession] = None
 
         self.target_clock: Optional[str] = None
+        self._vivado_needs_restart = False
 
         self._rw_log_file = None
         self._v_log_file = None
@@ -214,11 +215,17 @@ class MCPClient:
     async def call_vivado(self, tool_name: str, arguments: dict, timeout: float = 300.0) -> str:
         """Call a Vivado MCP tool. Raises MCPToolError on error responses."""
         logger.debug(f"[VIV] {tool_name} args={str(arguments)[:200]}")
+        if tool_name == "open_checkpoint" and self._vivado_needs_restart:
+            # A timed-out native command may still be changing the old design.
+            # Opening a checkpoint explicitly discards that state; do not wait
+            # indefinitely for the abandoned command before restoring from disk.
+            logger.warning("[VIV] Restarting timed-out Vivado before checkpoint recovery")
+            await self.call_vivado("restart_vivado", {}, timeout=300.0)
         t0 = time.time()
         try:
             result = await asyncio.wait_for(
-                self.vivado_session.call_tool(tool_name, arguments),
-                timeout=timeout,
+                self.vivado_session.call_tool(tool_name, {"timeout": timeout, **arguments}),
+                timeout=timeout + 5.0,  # Allow the backend timeout response to arrive.
             )
             elapsed = time.time() - t0
             logger.info(f"[VIV] {tool_name} completed in {elapsed:.2f}s")
@@ -226,12 +233,19 @@ class MCPClient:
                 response = "\n".join(c.text for c in result.content if hasattr(c, "text"))
             else:
                 response = "(no output)"
+            if getattr(result, "isError", False):
+                raise MCPToolError("VIV", tool_name, response)
             _detect_tool_error("VIV", tool_name, response)
+            if tool_name == "restart_vivado":
+                self._vivado_needs_restart = False
             return response
         except asyncio.TimeoutError:
+            self._vivado_needs_restart = True
             logger.error(f"[VIV] {tool_name} TIMED OUT after {time.time()-t0:.2f}s")
             raise
         except MCPToolError as e:
+            if "timed out" in str(e).lower() or "terminated unexpectedly" in str(e).lower():
+                self._vivado_needs_restart = True
             logger.error(f"[VIV] {tool_name} returned error: {e}")
             raise
         except Exception as e:
@@ -253,14 +267,14 @@ class MCPClient:
             "set contest_clk [get_clocks -quiet clk_fpl26contest]; "
             "if {$contest_clk ne {}} { "
             "  puts \"CLOCK:clk_fpl26contest\"; "
-            "  puts [get_property PERIOD $contest_clk]; "
+            '  puts "PERIOD_NS:[get_property PERIOD $contest_clk]"; '
             "} else { "
             "  set tp [get_timing_paths -max_paths 1 -setup]; "
             "  if {$tp ne {}} { "
             "    set clk [get_property ENDPOINT_CLOCK $tp]; "
             "    if {$clk ne {}} { "
             "      puts \"CLOCK:$clk\"; "
-            "      puts [get_property PERIOD [get_clocks $clk]]; "
+            '      puts "PERIOD_NS:[get_property PERIOD [get_clocks $clk]]"; '
             "    } "
             "  } "
             "}"
@@ -268,14 +282,15 @@ class MCPClient:
         try:
             result = await self.call_vivado("run_tcl", {"command": tcl_cmd})
             clock_name = None
-            for token in result.strip().split():
+            for token in result.splitlines():
+                token = token.strip()
                 if token.startswith("CLOCK:"):
                     clock_name = token[len("CLOCK:"):]
                     continue
-                if token.startswith(("ERROR", "WARNING")):
+                if not token.startswith("PERIOD_NS:"):
                     continue
                 try:
-                    period = float(token)
+                    period = float(token[len("PERIOD_NS:"):])
                     if period > 0:
                         self.target_clock = clock_name
                         logger.info(f"Target clock: {clock_name}, period: {period:.3f} ns")

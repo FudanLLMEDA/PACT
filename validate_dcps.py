@@ -16,6 +16,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -179,7 +180,11 @@ class DCPValidator:
         debug: bool = False,
         no_reactive: bool = False,
         work_dir: Optional[Path] = None,
+        elaboration_timeout: float = 3600.0,
     ):
+        if not math.isfinite(elaboration_timeout) or elaboration_timeout <= 0:
+            raise ValueError("elaboration_timeout must be finite and positive")
+        self.elaboration_timeout = elaboration_timeout
         self.golden_dcp = golden_dcp
         self.revised_dcp = revised_dcp
         self.num_vectors = num_vectors
@@ -208,6 +213,22 @@ class DCPValidator:
         self.preflight_report = None
         self.infrastructure_failure = False
         self.infrastructure_reason = None
+
+    def _record_tool_failure(self, stage: str, result) -> None:
+        # A failed compiler/elaborator has not compared any output vectors.
+        # SIGKILL can be caused by OOM, but requires external evidence to prove it.
+        output = (result.stdout or "") + (result.stderr or "")
+        killed = result.returncode in (-9, 137) or bool(re.search(r"\bKilled\b", output))
+        self.infrastructure_failure = True
+        self.infrastructure_reason = f"{'tool_killed' if killed else 'tool_failed'}_in_{stage}"
+        self.simulation_report = {
+            "infrastructure_failure": True,
+            "infrastructure_reason": self.infrastructure_reason,
+            "stage": stage,
+            "returncode": result.returncode,
+            "killed": killed,
+            "diagnostic_tail": output[-4000:],
+        }
 
     def _copy_dcp_for_rapidwright(self, src_dcp: Path, label: str) -> Path:
         """Copy a DCP into validator-owned space and build a fresh EDIF sidecar.
@@ -1424,7 +1445,7 @@ endmodule
                 raise RuntimeError("Vivado not found in PATH. Set VIVADO_EXEC env var or add Vivado to PATH.")
             
             # Vivado sim lib is at: $XILINX_VIVADO/data/verilog/src/
-            vivado_bin_dir = Path(vivado_path).parent
+            vivado_bin_dir = Path(vivado_path).expanduser().resolve().parent
             vivado_install = vivado_bin_dir.parent
             unisim_dir = vivado_install / "data" / "verilog" / "src"
             
@@ -1506,7 +1527,7 @@ endmodule
             # Compile Verilog files
             logger.info("Compiling with xvlog...")
             compile_cmd = [
-                "xvlog",
+                str(vivado_bin_dir / "xvlog"),
                 "-work", "work",
                 str(golden_v),
                 str(revised_renamed),
@@ -1524,7 +1545,7 @@ endmodule
             # xvlog/xelab times scale with design size; xsim time scales with both
             # design size and num_vectors.
             xvlog_timeout_s = 1800   # 30 min
-            xelab_timeout_s = 3600   # 60 min - elaborates both designs
+            xelab_timeout_s = self.elaboration_timeout
             # xsim: per-cycle cost is roughly proportional to the number of
             # primitive cells. Two copies of a 100k-LUT design (e.g.
             # corescore_500_mod) measured ~0.3s/cycle. We add a generous baseline
@@ -1543,6 +1564,7 @@ endmodule
             )
             
             if result.returncode != 0:
+                self._record_tool_failure(current_step, result)
                 print(f"\n✗ Compilation failed:")
                 print(result.stdout)
                 print(result.stderr)
@@ -1561,7 +1583,7 @@ endmodule
             # the per-module compile loop on huge designs but doesn't hurt.
             logger.info("Elaborating with xelab...")
             elab_cmd = [
-                "xelab",
+                str(vivado_bin_dir / "xelab"),
                 "--debug", "off",
                 "--mt", "auto",
                 "-L", "unisims_ver",  # Link against UNISIM library
@@ -1599,6 +1621,7 @@ endmodule
                         "details": "xelab elaboration failed due to missing SIP modules"
                     }
                 
+                self._record_tool_failure(current_step, result)
                 print(f"\n✗ Elaboration failed:")
                 print(result.stdout)
                 print(result.stderr)
@@ -1611,7 +1634,7 @@ endmodule
                 print(f"\nSimulating {vector_count} test vectors ({label})...")
 
                 sim_cmd = [
-                    "xsim",
+                    str(vivado_bin_dir / "xsim"),
                     "testbench_sim",
                     "-R",
                     "--testplusarg", f"NUM_VECTORS={vector_count}",
@@ -1886,6 +1909,7 @@ endmodule
             "revised_dcp": str(self.revised_dcp),
             "num_vectors": self.num_vectors,
             "precheck_vectors": self.precheck_vectors,
+            "elaboration_timeout_s": self.elaboration_timeout,
             "runtime_seconds": elapsed_time,
             "phase1_passed": self.phase1_passed,
             "phase2_passed": self.phase2_passed,
@@ -1952,10 +1976,15 @@ Examples:
         help="Disable reactive stimulus generation (use pure LFSR randomness)"
     )
 
+    parser.add_argument("--elaboration-timeout", type=float, default=3600.0,
+                        help="xelab elaboration timeout in seconds (default: 3600)")
     parser.add_argument("--work-dir", type=Path, help="Parent directory for preserved validation evidence")
     parser.add_argument("--report-json", type=Path, help="Copy the detailed validation report to this path")
     args = parser.parse_args()
     
+    if not math.isfinite(args.elaboration_timeout) or args.elaboration_timeout <= 0:
+        parser.error("--elaboration-timeout must be finite and positive")
+
     # Validate inputs
     if not args.golden_dcp.exists():
         print(f"Error: Golden DCP not found: {args.golden_dcp}", file=sys.stderr)
@@ -1985,6 +2014,7 @@ Examples:
         debug=args.debug,
         no_reactive=args.no_reactive,
         work_dir=args.work_dir,
+        elaboration_timeout=args.elaboration_timeout,
     )
     
     try:

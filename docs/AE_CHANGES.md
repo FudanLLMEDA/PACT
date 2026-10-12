@@ -1,5 +1,9 @@
 # FPT'26 AE reusable-artifact corrections (v1.0.3)
 
+This is the historical v1.0.3 record. For the v1.0.4 fixes and subsequent real
+Vivado evidence, see [AE execution follow-up](AE_FOLLOWUP_2026-10-12.md) and
+[runtime guidance](AE_RUNTIME.md).
+
 This change is on the v1 maintenance line. It does not change v2/main,
 or rewrite published tags. The release metadata records publication links and
 checksums separately from the local validation record below.

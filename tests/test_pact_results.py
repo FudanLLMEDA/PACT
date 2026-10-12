@@ -185,6 +185,7 @@ def test_functional_skipped_report_is_not_pass(tmp_path, monkeypatch):
     ("passed", False, True, "completed", 0, True),
     ("failed", False, True, "validation_failed", 2, False),
     ("timeout", False, True, "validation_failed", 2, False),
+    ("infrastructure_failed", False, True, "validation_failed", 2, False),
     ("not_checked", True, True, "functional_not_checked", 0, True),
     ("passed", False, False, "validation_failed", 2, False),
 ])
@@ -210,14 +211,19 @@ def test_final_export_contract(tmp_path, monkeypatch, functional, skip, gate_pas
     functional_mock = AsyncMock(return_value={"status": functional})
     monkeypatch.setattr(agent, "check_functional", functional_mock)
     out = tmp_path / "output.dcp"
-    rc = asyncio.run(agent.run(dcp, out, use_llm=False, run_dir=tmp_path / "run", skip_functional_check=skip))
+    rc = asyncio.run(agent.run(dcp, out, use_llm=False, run_dir=tmp_path / "run",
+                              skip_functional_check=skip, recipe_timeout_scale=2, elaboration_timeout=5400))
     assert rc == expected_rc
     assert out.exists() is exported
     summary = json.loads((tmp_path / "run/summary.json").read_text())
     assert summary["status"] == expected_status
+    assert summary["recipe_timeout_scale"] == 2
+    assert summary["elaboration_timeout_s"] == 5400
     assert (summary["output_dcp"] is not None) is exported
     if not gate_pass or skip:
         functional_mock.assert_not_awaited()
+    else:
+        assert functional_mock.await_args.kwargs["elaboration_timeout"] == 5400
 
 
 def test_validator_does_not_return_success_for_skipped_simulation(tmp_path):
@@ -235,3 +241,100 @@ def test_nan_report_is_missing_and_json_serializable():
     assert not result["passed"]
     assert result["checks"]["setup"] == "missing"
     json.dumps(result, allow_nan=False)
+
+
+def test_llm_dispatch_uses_selected_target_recipe(tmp_path, monkeypatch):
+    import copy
+    from FDAgents.recipe_planner import HIGH_UTIL_TARGET_PERIOD_CLOCK_TIGHTEN_PARAMS
+    dcp = tmp_path / "input.dcp"
+    dcp.write_bytes(b"input")
+    fake_mcp = SimpleNamespace(start_servers=AsyncMock(), cleanup=AsyncMock())
+    monkeypatch.setattr(agent, "MCPClient", lambda *a, **kw: fake_mcp)
+    monkeypatch.setattr(agent, "initial_analysis", AsyncMock(return_value={
+        "baseline_wns": -0.1, "clock_period": 10.0, "fanout_nets": [],
+        "fanout_count": 0, "timing_summary": "synthetic"}))
+    monkeypatch.setattr(agent, "capture_constraints", AsyncMock(return_value={"xdc": "original.xdc", "clocks": []}))
+    class FakeLLM(agent.RuleOnlyLLMStats):
+        def call(self, task, memory, extra=None):
+            if task == "analyze_timing":
+                return {"bottleneck": "mixed", "suggested_skill_order": ["clock_tighten"],
+                        "initial_params": {"clock_tighten": copy.deepcopy(HIGH_UTIL_TARGET_PERIOD_CLOCK_TIGHTEN_PARAMS)}}
+            return {"skill": "clock_tighten", "target": "target_period_fast_route_floor", "params": {}}
+    monkeypatch.setattr(agent, "LLMClient", lambda **kw: FakeLLM())
+    monkeypatch.setattr(agent.rules, "quick_filter", lambda mem: None)
+    monkeypatch.setattr(agent, "_action_override_reason", lambda *a, **kw: None)
+    monkeypatch.setattr(agent, "MAX_ROUNDS", 1)
+    captured = {}
+    async def execute(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop after inspecting dispatched parameters")
+    monkeypatch.setitem(agent.SKILLS, "clock_tighten", SimpleNamespace(execute=execute))
+    rc = asyncio.run(agent.run(dcp, tmp_path / "out.dcp", run_dir=tmp_path / "run", force_llm_analysis=True))
+    assert rc == 1
+    params = captured["params"]
+    assert [r["name"] for r in params["recipes"]] == ["target_period_fast_route_floor"]
+    assert params["recipe_timeout_s"] == 3000
+    assert "target_params" not in params
+
+
+@pytest.mark.parametrize("column", [6, 10])
+def test_rounded_slack_cannot_hide_failing_hold_or_pulse_endpoints(column):
+    report = timing(whs="-0.000", wpws="-0.000").splitlines()
+    values = report[2].split()
+    values[column] = "1"
+    report[2] = " ".join(values)
+    assert not classify_reports(ROUTE, "\n".join(report))["passed"]
+
+
+def test_recipe_timeout_scale_preserves_priors_and_other_parameters():
+    params = {"recipe_timeout_s": 3000, "min_remaining_s": 2400, "max_candidates": 1}
+    assert agent._scale_recipe_timeout(params, 2) == {**params, "recipe_timeout_s": 6000}
+    assert params["recipe_timeout_s"] == 3000
+    assert agent._scale_recipe_timeout(params, 1) == params
+    assert agent._scale_recipe_timeout({"max_candidates": 1}, 2) == {"max_candidates": 1}
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf")])
+def test_invalid_runtime_controls_are_rejected(tmp_path, value):
+    from validate_dcps import DCPValidator
+    with pytest.raises(ValueError):
+        agent._scale_recipe_timeout({}, value)
+    with pytest.raises(ValueError):
+        DCPValidator(tmp_path / "in.dcp", tmp_path / "out.dcp", work_dir=tmp_path,
+                     elaboration_timeout=value)
+    with pytest.raises(ValueError):
+        asyncio.run(agent.run(tmp_path / "in.dcp", tmp_path / "out.dcp",
+                             run_dir=tmp_path / "run", recipe_timeout_scale=value))
+    assert not (tmp_path / "run").exists()
+
+
+@pytest.mark.parametrize("rc,stderr,killed", [
+    (-9, "", True), (137, "tool terminated", True),
+    (1, 'rdiArgs.sh: 718 Killed "$RDI_PROG" "$@"', True),
+    (1, "compilation error", False),
+])
+def test_elaboration_failure_is_not_a_functional_mismatch(tmp_path, rc, stderr, killed):
+    from validate_dcps import DCPValidator
+    validator = DCPValidator(tmp_path / "in.dcp", tmp_path / "out.dcp", work_dir=tmp_path,
+                             elaboration_timeout=5400)
+    validator._record_tool_failure("xelab (elaboration)",
+                                   SimpleNamespace(returncode=rc, stdout="", stderr=stderr))
+    assert validator.infrastructure_failure
+    assert not validator.phase2_passed
+    assert validator.simulation_report["killed"] == killed
+    assert validator.simulation_report["returncode"] == rc
+    assert "mismatch_count" not in validator.simulation_report
+    assert "out_of_memory" not in validator.infrastructure_reason  # SIGKILL alone is not OOM proof.
+
+
+def test_functional_wrapper_passes_timeout_and_preserves_infrastructure_status(tmp_path, monkeypatch):
+    calls = []
+    async def create(*args, **kwargs):
+        calls.append(args)
+        (tmp_path / "functional.json").write_text(json.dumps({"infrastructure_failure": True}))
+        return SimpleNamespace(wait=AsyncMock(return_value=2))
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    result = asyncio.run(check_functional(tmp_path / "in.dcp", tmp_path / "out.dcp", tmp_path,
+                                         7200, elaboration_timeout=5400))
+    assert result["status"] == "infrastructure_failed"
+    assert calls[0][-2:] == ("--elaboration-timeout", "5400")

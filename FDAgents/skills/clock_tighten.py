@@ -469,7 +469,9 @@ def build_clock_as_data_false_path_tcl(
 
 
 def _exception_looks_like_timeout(exc: Exception) -> bool:
-    return isinstance(exc, TimeoutError) or "timeout" in str(exc).lower()
+    return isinstance(exc, TimeoutError) or any(
+        text in str(exc).lower() for text in ("timeout", "timed out")
+    )
 
 
 class ClockTightenSkill:

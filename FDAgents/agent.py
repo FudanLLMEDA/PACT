@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -1846,6 +1847,15 @@ def _parse_utilization_report(report: str) -> dict:
 # Main optimization loop
 # ------------------------------------------------------------------
 
+def _scale_recipe_timeout(params: dict, scale: float) -> dict:
+    """Scale only an explicitly configured recipe timeout, without mutating priors."""
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError("recipe_timeout_scale must be finite and positive")
+    if "recipe_timeout_s" not in params:
+        return params
+    return {**params, "recipe_timeout_s": float(params["recipe_timeout_s"]) * scale}
+
+
 async def run(
     input_dcp: Path,
     output_dcp: Path,
@@ -1860,10 +1870,15 @@ async def run(
     use_llm: bool = True,
     skip_functional_check: bool = False,
     validation_timeout: float = 1800.0,
+    recipe_timeout_scale: float = 1.0,
+    elaboration_timeout: float = 3600.0,
 ) -> int:
     """
     Main entry point.  Returns 0 on success, non-zero on failure.
     """
+    if any(not math.isfinite(v) or v <= 0 for v in
+           (time_limit, validation_timeout, recipe_timeout_scale, elaboration_timeout)):
+        raise ValueError("time limits and recipe timeout scale must be finite and positive")
     if run_dir is None:
         ts = time.strftime("%Y%m%d_%H%M%S")
         run_dir = Path.cwd() / f"fdagents_run-{ts}"
@@ -1886,6 +1901,8 @@ async def run(
         "requested_output_dcp": str(output_dcp), "run_dir": str(run_dir),
         "model": model if use_llm else "rule-only", "time_limit_s": time_limit,
         "validation_timeout_s": validation_timeout,
+        "recipe_timeout_scale": recipe_timeout_scale,
+        "elaboration_timeout_s": elaboration_timeout,
         "skip_functional_check": skip_functional_check,
         "force_llm_analysis": force_llm_analysis,
         "replay_known_benchmark": replay_known_benchmark,
@@ -2185,7 +2202,7 @@ async def run(
             override_reason = None
             is_deep_only = skill_name in DEEP_ONLY_SKILLS
             if not is_deep_only:
-                params = _merge_skill_params(mem, skill_name, params)
+                params = _merge_skill_params_for_target(mem, skill_name, target, params)
                 params = _fit_skill_scope_to_budget(mem, skill_name, params)
 
             override_reason = _action_override_reason(
@@ -2207,12 +2224,13 @@ async def run(
                 old_choice = f"{skill_name}/{target!r}"
                 skill_name, target, params = fb
                 is_deep_only = False
-                params = _merge_skill_params(mem, skill_name, params)
+                params = _merge_skill_params_for_target(mem, skill_name, target, params)
                 params = _fit_skill_scope_to_budget(mem, skill_name, params)
                 logger.warning(
                     f"[agent] Override LLM ({override_reason}); was {old_choice} → {skill_name}/{target!r}"
                 )
 
+            params = _scale_recipe_timeout(params, recipe_timeout_scale)
             logger.info(f"[agent] Action: skill={skill_name} target={target!r} params={params}")
 
             skill = SKILLS[skill_name]
@@ -2385,7 +2403,8 @@ async def run(
         await mcp.cleanup()
         if not skip_functional_check:
             functional = await check_functional(input_dcp, final_candidate,
-                                                run_dir / "validation" / "final", validation_timeout)
+                                                run_dir / "validation" / "final", validation_timeout,
+                                                elaboration_timeout=elaboration_timeout)
             validation["functional"] = functional["status"]
             validation["functional_evidence"] = functional
             write_summary(run_dir / "validation" / "final" / "validation.json", validation)
@@ -2480,6 +2499,10 @@ Examples:
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help="LLM model name")
     parser.add_argument("--time-limit", type=float, default=3600.0, help="Time limit in seconds")
+    parser.add_argument("--recipe-timeout-scale", type=float, default=1.0,
+                        help="Scale explicit per-recipe timeouts for slower machines (default: 1; does not extend --time-limit)")
+    parser.add_argument("--elaboration-timeout", type=float, default=3600.0,
+                        help="xelab timeout within final verification (default: 3600 seconds)")
     parser.add_argument("--skip-functional-check", action="store_true",
                         help="Export route/timing-checked output without a functional pass; excluded from validated aggregates")
     parser.add_argument("--validation-timeout", type=float, default=1800.0,
@@ -2516,8 +2539,9 @@ Examples:
     )
     args = parser.parse_args()
 
-    if args.time_limit <= 0 or args.validation_timeout <= 0:
-        parser.error("time limits must be positive")
+    if any(not math.isfinite(v) or v <= 0 for v in
+           (args.time_limit, args.validation_timeout, args.recipe_timeout_scale, args.elaboration_timeout)):
+        parser.error("time limits and recipe timeout scale must be finite and positive")
 
     # Validate input
     if not args.input_dcp.exists():
@@ -2547,6 +2571,8 @@ Examples:
         use_llm=not args.no_llm,
         skip_functional_check=args.skip_functional_check,
         validation_timeout=args.validation_timeout,
+        recipe_timeout_scale=args.recipe_timeout_scale,
+        elaboration_timeout=args.elaboration_timeout,
     ))
     sys.exit(rc)
 

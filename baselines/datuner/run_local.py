@@ -262,7 +262,7 @@ def parse_timing_summary(rpt_path="timing_summary.rpt"):
 def run_vivado(dcp_path, cfg, target_period_ns, baseline, work_dir, timeout_s=3600,
                route_only=False, no_clock_tighten=False):
     """Run one Vivado eval. Returns (wns, metadata) or (None, error)."""
-    work_dir = Path(work_dir)
+    work_dir = Path(work_dir).expanduser().resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
 
     write_options_tcl(cfg, target_period_ns, baseline, str(work_dir / "options.tcl"),
@@ -325,7 +325,7 @@ def run_vivado(dcp_path, cfg, target_period_ns, baseline, work_dir, timeout_s=36
 def run_datuner_local(dcp_path, budget, output_dir, timeout_s=3600,
                       no_clock_tighten=False, route_only=False):
     """Main bandit search loop."""
-    output_dir = Path(output_dir)
+    output_dir = Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Probe baseline
